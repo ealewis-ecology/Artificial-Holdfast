@@ -277,8 +277,14 @@ def build_meshes(segs, sides):
     return meshes
 
 def manifold_union_all(meshes):
-    """Union all meshes via manifold3d directly (no binary tree needed)."""
+    """Union all meshes via manifold3d using a parallel binary-tree reduce.
+
+    Each level of the tree unions equally-sized pairs in parallel (manifold3d
+    releases the GIL, so Python threads give real concurrency).  Depth is
+    O(log N) instead of O(N), and no intermediate mesh grows unboundedly.
+    """
     from manifold3d import Manifold, Mesh
+    from concurrent.futures import ThreadPoolExecutor
 
     def to_m(m):
         return Manifold(mesh=Mesh(
@@ -286,11 +292,21 @@ def manifold_union_all(meshes):
             tri_verts=m.faces.astype(np.uint32),
         ))
 
-    result = to_m(meshes[0])
-    for m in meshes[1:]:
-        result = result + to_m(m)
+    def union_pair(pair):
+        return pair[0] + pair[1]
 
-    r = result.to_mesh()
+    # Convert all trimesh → Manifold in parallel
+    with ThreadPoolExecutor() as ex:
+        level = list(ex.map(to_m, meshes))
+
+    # Binary-tree reduce: each level halves the list, all pairs in parallel
+    while len(level) > 1:
+        pairs = list(zip(level[0::2], level[1::2]))
+        tail  = [level[-1]] if len(level) % 2 else []
+        with ThreadPoolExecutor() as ex:
+            level = list(ex.map(union_pair, pairs)) + tail
+
+    r = level[0].to_mesh()
     return trimesh.Trimesh(vertices=np.array(r.vert_properties),
                            faces=np.array(r.tri_verts), process=False)
 
