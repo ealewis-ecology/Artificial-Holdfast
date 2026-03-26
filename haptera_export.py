@@ -21,8 +21,9 @@ class Tee:
 # ── configuration ─────────────────────────────────────────────────────────────
 TESTING     = False  # True = matplotlib preview only, no mesh or export
 FAST_EXPORT = False  # True = export mesh without volume fitting or measurements
+DEBUG       = True  # True = print per-function timing diagnostics
 
-DEPTH  = 20 #Number of nodes
+DEPTH  = 10 #Number of nodes
 K      = 2 #Number of branches per node
 SHRINK = 0.65
 OUTPUT      = "haptera_d{}_k{}_s{}.stl".format(DEPTH, K, int(SHRINK * 100))
@@ -276,13 +277,9 @@ def build_meshes(segs, sides):
             meshes.append(m)
     return meshes
 
-def manifold_union_all(meshes):
-    """Union all meshes via manifold3d using a parallel binary-tree reduce.
-
-    Each level of the tree unions equally-sized pairs in parallel (manifold3d
-    releases the GIL, so Python threads give real concurrency).  Depth is
-    O(log N) instead of O(N), and no intermediate mesh grows unboundedly.
-    """
+def _run_manifold_union(meshes, _log):
+    """Binary-tree parallel union. Returns the raw Manifold object (no trimesh conversion)."""
+    import time
     from manifold3d import Manifold, Mesh
     from concurrent.futures import ThreadPoolExecutor
 
@@ -295,41 +292,92 @@ def manifold_union_all(meshes):
     def union_pair(pair):
         return pair[0] + pair[1]
 
-    # Convert all trimesh → Manifold in parallel
+    _log(f"    [manifold_union] converting {len(meshes)} meshes to Manifold...")
+    t0 = time.perf_counter()
     with ThreadPoolExecutor() as ex:
         level = list(ex.map(to_m, meshes))
+    _log(f"    [manifold_union] conversion done  {time.perf_counter()-t0:.2f}s")
 
-    # Binary-tree reduce: each level halves the list, all pairs in parallel
+    tree_level = 1
     while len(level) > 1:
         pairs = list(zip(level[0::2], level[1::2]))
         tail  = [level[-1]] if len(level) % 2 else []
+        _log(f"    [manifold_union] tree level {tree_level}: {len(pairs)} pairs ({len(level)} → {len(pairs) + len(tail)})...")
+        t0 = time.perf_counter()
         with ThreadPoolExecutor() as ex:
             level = list(ex.map(union_pair, pairs)) + tail
+        _log(f"    [manifold_union] level {tree_level} done  {time.perf_counter()-t0:.2f}s")
+        tree_level += 1
 
-    r = level[0].to_mesh()
-    return trimesh.Trimesh(vertices=np.array(r.vert_properties),
-                           faces=np.array(r.tri_verts), process=False)
+    return level[0]
+
+
+def _manifold_to_trimesh(manifold, _log):
+    """Convert a Manifold to trimesh.Trimesh. Only called once after convergence.
+
+    process=False and validate=False skip all mesh cleanup and validation — safe
+    because manifold3d guarantees a watertight, non-self-intersecting mesh.
+    Arrays are passed directly (no extra copies).
+    """
+    import time
+    _log("    [extract_mesh] converting Manifold to trimesh...")
+    t0 = time.perf_counter()
+    r  = manifold.to_mesh()
+    result = trimesh.Trimesh(
+        vertices=r.vert_properties,
+        faces=r.tri_verts,
+        process=False,
+        validate=False,
+    )
+    _log(f"    [extract_mesh] done  {time.perf_counter()-t0:.2f}s  "
+         f"({len(result.vertices)} verts, {len(result.faces)} faces)")
+    return result
+
 
 def build_union_mesh(segs, sides):
-    """Build and return the boolean union of all tube meshes."""
+    """Build and return the boolean union of all tube meshes as a trimesh.Trimesh.
+
+    Used by surface_area mode (needs face normals for wetted-area detection).
+    For volume mode use build_manifold() instead — it skips the trimesh
+    conversion, measuring volume directly on the Manifold object.
+    """
     import time
     try:
         from tqdm import tqdm as _tqdm
         _log = _tqdm.write
     except ImportError:
         _log = print
+    _dlog = _log if DEBUG else (lambda _: None)
 
+    _dlog(f"    [build_meshes] building {len(segs)} tube meshes...")
     t0     = time.perf_counter()
     meshes = build_meshes(segs, sides)
-    t1     = time.perf_counter()
-    _log(f"    build meshes   {t1-t0:6.2f}s  ({len(meshes)} tubes)")
+    _dlog(f"    [build_meshes] done  {time.perf_counter()-t0:.2f}s")
 
-    _log("    manifold union ...")
-    unioned = manifold_union_all(meshes)
-    t2 = time.perf_counter()
-    _log(f"    union          {t2-t1:6.2f}s")
+    manifold = _run_manifold_union(meshes, _dlog)
+    return _manifold_to_trimesh(manifold, _dlog)
 
-    return unioned
+
+def build_manifold(segs, sides):
+    """Build the boolean union and return the raw Manifold (no trimesh conversion).
+
+    Used by volume mode: Manifold.volume() reads the volume directly in C++,
+    so we never pay the trimesh extraction cost during iteration.
+    """
+    import time
+    try:
+        from tqdm import tqdm as _tqdm
+        _log = _tqdm.write
+    except ImportError:
+        _log = print
+    _dlog = _log if DEBUG else (lambda _: None)
+
+    _dlog(f"    [build_meshes] building {len(segs)} tube meshes...")
+    t0     = time.perf_counter()
+    meshes = build_meshes(segs, sides)
+    _dlog(f"    [build_meshes] done  {time.perf_counter()-t0:.2f}s")
+
+    return _run_manifold_union(meshes, _dlog)
 
 # ── segment builder ───────────────────────────────────────────────────────────
 def build_segments(depth, k, shrink):
@@ -355,9 +403,14 @@ def build_segments(depth, k, shrink):
     return segs
 
 # ── main ──────────────────────────────────────────────────────────────────────
+import time as _time
 print(f"Building segments (depth={DEPTH}, k={K}, shrink={SHRINK})...")
+_t = _time.perf_counter()
 segs = build_segments(DEPTH, K, SHRINK)
-print(f"  {len(segs)} segments generated")
+if DEBUG:
+    print(f"  [build_segments] done  {_time.perf_counter()-_t:.2f}s  {len(segs)} segments")
+else:
+    print(f"  {len(segs)} segments generated")
 
 # ── testing / preview mode ────────────────────────────────────────────────────
 if TESTING:
@@ -399,10 +452,16 @@ if TARGET_MODE == "surface_area":
     except ImportError:
         _ibar = None
         _log  = print
+    import time as _time
+    _dlog = _log if DEBUG else (lambda _: None)
     final_mesh = None
     for iteration in range(1, MAX_ITERS + 1):
+        _dlog(f"  ── iter {iteration} ──────────────────────────────")
         unioned = build_union_mesh(segs, TUBE_SIDES)
+        _dlog(f"    [measure_SA] computing wetted surface area...")
+        _tm = _time.perf_counter()
         wetted_sa, _ = mesh_wetted_area(unioned)
+        _dlog(f"    [measure_SA] done  {_time.perf_counter()-_tm:.2f}s")
         error = abs(wetted_sa - TARGET_SURFACE_AREA) / TARGET_SURFACE_AREA
         msg   = f"  iter {iteration}: SA={wetted_sa:.4f}  error={error*100:.3f}%"
         if error <= TOLERANCE:
@@ -410,8 +469,11 @@ if TARGET_MODE == "surface_area":
             if _ibar: _ibar.update(1)
             final_mesh = unioned
             break
+        _dlog(f"    [correction] computing quadratic SA correction...")
+        _tm = _time.perf_counter()
         correction = quadratic_sa_correction(naive_surface_area(segs), wetted_sa, TARGET_SURFACE_AREA)
         scale_radii(segs, correction)
+        _dlog(f"    [correction] done  {_time.perf_counter()-_tm:.4f}s  f={correction:.5f}")
         _log(msg + f"  → ×{correction:.5f}")
         if _ibar: _ibar.update(1)
         if iteration == MAX_ITERS:
@@ -430,40 +492,60 @@ else:  # TARGET_MODE == "volume"
     except ImportError:
         _ibar = None
         _log  = print
-    final_mesh = None
+    import time as _time
+    _dlog = _log if DEBUG else (lambda _: None)
+    final_manifold = None
     for iteration in range(1, MAX_ITERS + 1):
-        unioned      = build_union_mesh(segs, TUBE_SIDES)
-        measured_vol = unioned.volume
+        _dlog(f"  ── iter {iteration} ──────────────────────────────")
+        manifold = build_manifold(segs, TUBE_SIDES)
+        # Read volume directly from the Manifold object — no trimesh conversion needed
+        _dlog(f"    [measure_vol] reading volume from Manifold (C++)...")
+        _tm = _time.perf_counter()
+        measured_vol = manifold.volume()
+        _dlog(f"    [measure_vol] done  {_time.perf_counter()-_tm:.4f}s  vol={measured_vol:.4f}")
         error = abs(measured_vol - BASE_VOLUME) / BASE_VOLUME
         msg   = f"  iter {iteration}: vol={measured_vol:.4f}  error={error*100:.3f}%"
         if error <= TOLERANCE:
             _log(msg + "  ✓ converged")
             if _ibar: _ibar.update(1)
-            final_mesh = unioned
+            final_manifold = manifold
             break
+        _dlog(f"    [correction] computing cubic volume correction...")
+        _tm = _time.perf_counter()
         correction = cubic_correction(naive_volume(segs), measured_vol, BASE_VOLUME)
         scale_radii(segs, correction)
+        _dlog(f"    [correction] done  {_time.perf_counter()-_tm:.4f}s  f={correction:.5f}")
         _log(msg + f"  → ×{correction:.5f}")
         if _ibar: _ibar.update(1)
         if iteration == MAX_ITERS:
             _log("  ! max iterations reached")
-            final_mesh = unioned
+            final_manifold = manifold
     if _ibar: _ibar.close()
-    combined         = final_mesh
-    final_vol        = combined.volume
+    # Convert to trimesh exactly once, after all iterations are done
+    combined  = _manifold_to_trimesh(final_manifold, _dlog)
+    final_vol = measured_vol  # already known from last manifold.volume() call
+if DEBUG: print(f"[export] writing {OUTPUT}...")
+_t = _time.perf_counter()
 combined.export(OUTPUT)
+if DEBUG: print(f"[export] done  {_time.perf_counter()-_t:.2f}s")
 sys.stdout = Tee(TEXT_OUTPUT)
 
 # ── surface area ──────────────────────────────────────────────────────────────
+if DEBUG: print(f"[surface_area] computing haptera surface area...")
+_t = _time.perf_counter()
 haptera_surface_area = combined.area
 base_mask = combined.face_normals[:, 2] < -0.999
 base_cap_area = float(trimesh.triangles.area(combined.triangles[base_mask]).sum()) if base_mask.any() else 0.0
 area_note = "exact (includes flat base cap)"
+if DEBUG: print(f"[surface_area] done  {_time.perf_counter()-_t:.2f}s  area={haptera_surface_area:.4f}")
 
 # ── convex hull (bounding envelope) ───────────────────────────────────────────
+if DEBUG: print(f"[convex_hull] computing bounding envelope...")
+_t = _time.perf_counter()
 haptera_hull      = combined.convex_hull
 hull_volume       = haptera_hull.volume
 hull_surface_area = haptera_hull.area
+if DEBUG: print(f"[convex_hull] done  {_time.perf_counter()-_t:.2f}s  hull_vol={hull_volume:.4f}")
 
 # ── cone geometry (analytical, for reference) ─────────────────────────────────
 cone_volume       = (1.0 / 3.0) * np.pi * CONE_R**2 * CONE_H
