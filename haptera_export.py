@@ -25,7 +25,7 @@ DEBUG       = True  # True = print per-function timing diagnostics
 
 DEPTH  = 10 #Number of nodes
 K      = 2 #Number of branches per node
-SHRINK = 0.65
+SHRINK = 1
 OUTPUT      = "haptera_d{}_k{}_s{}.stl".format(DEPTH, K, int(SHRINK * 100))
 TEXT_OUTPUT = OUTPUT.replace(".stl", ".txt")
 
@@ -46,7 +46,8 @@ N_ROOTS        = 20
 SEG_LEN        = 0.1
 REF_ROOT_R     = 5
 STEER_ONSET    = 0.55
-STEER_STRENGTH = 3.2
+STEER_STRENGTH = 1.5
+TORSION        = 0.6  # radians of extra branching-plane rotation per depth level (0 = no twist)
 
 _CONE_VOLUME = (1.0 / 3.0) * np.pi * CONE_R**2 * CONE_H
 _NOMINAL_VOLUME = 2 * N_ROOTS * np.pi * REF_ROOT_R**2 * SEG_LEN  # original calibration
@@ -54,7 +55,7 @@ _NOMINAL_VOLUME = 2 * N_ROOTS * np.pi * REF_ROOT_R**2 * SEG_LEN  # original cali
 # ── targets ───────────────────────────────────────────────────────────────────
 # "volume" mode — desired void (interstitial) space inside the cone.
 # Default matches original formula so existing runs are unaffected.
-TARGET_INTERSTITIAL_VOLUME = _CONE_VOLUME - _NOMINAL_VOLUME   # adjust as needed
+TARGET_INTERSTITIAL_VOLUME = 600 #_CONE_VOLUME - _NOMINAL_VOLUME   # adjust as needed
 
 # "surface_area" mode — desired wetted haptera surface area (base cap excluded).
 # Run once in volume mode first to see what surface area your tree naturally produces,
@@ -134,12 +135,13 @@ def grow(ox, oy, oz, dx, dy, dz, r, depth, k, seg_len, shrink, rng, max_depth, o
     seg_dir = np.array([ex-ox, ey-oy, ez-oz])
     seg_dir /= np.linalg.norm(seg_dir)
     dx, dy, dz = seg_dir
+    phi = np.arctan2(dy, dx) + (max_depth - depth) * TORSION  # parent direction + per-level twist
     for i in range(k):
-        angle  = (2 * np.pi * i / k) + rng() * 0.5 - 0.25
+        angle  = (2 * np.pi * i / k) + phi + rng() * 0.5 - 0.25
         spread = 0.28 + rng() * 0.18
         ndx = dx + np.cos(angle) * spread
         ndy = dy + np.sin(angle) * spread
-        ndz = dz + rng() * 0.05
+        ndz = dz + rng() * 0.3 - 0.1
         nl  = np.sqrt(ndx*ndx + ndy*ndy + ndz*ndz)
         grow(ex, ey, ez, ndx/nl, ndy/nl, ndz/nl,
              r, depth-1, k, seg_len*shrink, shrink, rng, max_depth, out)
@@ -179,7 +181,7 @@ def cubic_correction(V_naive, V_measured, V_target):
     cubic relationship.  In that case we fall back to the simple sqrt step,
     which is damped but still convergent.
     """
-    if V_naive <= 0 or V_measured <= 0:
+    if V_naive <= 0 or V_measured <= 0 or V_target <= 0:
         return 1.0
     V_overlap = V_naive - V_measured
     if V_overlap <= 0:                              # no detectable overlap
@@ -483,7 +485,7 @@ if TARGET_MODE == "surface_area":
     combined         = final_mesh
     final_vol        = combined.volume
 else:  # TARGET_MODE == "volume"
-    print(f"\nIterating to exact volume (target={BASE_VOLUME:.4f}, tol={TOLERANCE*100:.2f}%)...")
+    print(f"\nIterating to interstitial volume (target={TARGET_INTERSTITIAL_VOLUME:.4f}, tol={TOLERANCE*100:.2f}%)...")
     try:
         from tqdm import tqdm as _tqdm
         _ibar = _tqdm(total=MAX_ITERS, desc="  volume iters", unit="iter",
@@ -494,36 +496,49 @@ else:  # TARGET_MODE == "volume"
         _log  = print
     import time as _time
     _dlog = _log if DEBUG else (lambda _: None)
-    final_manifold = None
+    combined  = None
+    final_vol = None
     for iteration in range(1, MAX_ITERS + 1):
         _dlog(f"  ── iter {iteration} ──────────────────────────────")
         manifold = build_manifold(segs, TUBE_SIDES)
-        # Read volume directly from the Manifold object — no trimesh conversion needed
         _dlog(f"    [measure_vol] reading volume from Manifold (C++)...")
         _tm = _time.perf_counter()
         measured_vol = manifold.volume()
         _dlog(f"    [measure_vol] done  {_time.perf_counter()-_tm:.4f}s  vol={measured_vol:.4f}")
-        error = abs(measured_vol - BASE_VOLUME) / BASE_VOLUME
-        msg   = f"  iter {iteration}: vol={measured_vol:.4f}  error={error*100:.3f}%"
+        combined_iter = _manifold_to_trimesh(manifold, _dlog)
+        _dlog(f"    [measure_hull] computing convex hull volume...")
+        _tm = _time.perf_counter()
+        hull_vol_iter = combined_iter.convex_hull.volume
+        _dlog(f"    [measure_hull] done  {_time.perf_counter()-_tm:.4f}s  hull_vol={hull_vol_iter:.4f}")
+        interstitial_iter = hull_vol_iter - measured_vol
+        error = abs(interstitial_iter - TARGET_INTERSTITIAL_VOLUME) / TARGET_INTERSTITIAL_VOLUME
+        msg   = f"  iter {iteration}: interstitial={interstitial_iter:.4f}  haptera={measured_vol:.4f}  error={error*100:.3f}%"
         if error <= TOLERANCE:
             _log(msg + "  ✓ converged")
             if _ibar: _ibar.update(1)
-            final_manifold = manifold
+            combined  = combined_iter
+            final_vol = measured_vol
             break
-        _dlog(f"    [correction] computing cubic volume correction...")
+        haptera_target = hull_vol_iter - TARGET_INTERSTITIAL_VOLUME
+        if haptera_target <= 0:
+            _log(f"  ! TARGET_INTERSTITIAL_VOLUME ({TARGET_INTERSTITIAL_VOLUME:.4f}) >= hull volume "
+                 f"({hull_vol_iter:.4f}) — target is geometrically infeasible for this tree. "
+                 f"Lower TARGET_INTERSTITIAL_VOLUME and re-run.")
+            combined  = combined_iter
+            final_vol = measured_vol
+            break
+        _dlog(f"    [correction] computing cubic volume correction (haptera_target={haptera_target:.4f})...")
         _tm = _time.perf_counter()
-        correction = cubic_correction(naive_volume(segs), measured_vol, BASE_VOLUME)
+        correction = cubic_correction(naive_volume(segs), measured_vol, haptera_target)
         scale_radii(segs, correction)
         _dlog(f"    [correction] done  {_time.perf_counter()-_tm:.4f}s  f={correction:.5f}")
         _log(msg + f"  → ×{correction:.5f}")
         if _ibar: _ibar.update(1)
         if iteration == MAX_ITERS:
             _log("  ! max iterations reached")
-            final_manifold = manifold
+            combined  = combined_iter
+            final_vol = measured_vol
     if _ibar: _ibar.close()
-    # Convert to trimesh exactly once, after all iterations are done
-    combined  = _manifold_to_trimesh(final_manifold, _dlog)
-    final_vol = measured_vol  # already known from last manifold.volume() call
 if DEBUG: print(f"[export] writing {OUTPUT}...")
 _t = _time.perf_counter()
 combined.export(OUTPUT)
@@ -553,12 +568,10 @@ cone_lateral_area = np.pi * CONE_R * np.sqrt(CONE_R**2 + CONE_H**2)
 cone_base_area    = np.pi * CONE_R**2
 
 # ── interstitial measurements ─────────────────────────────────────────────────
-interstitial_volume   = hull_volume - final_vol
-external_surface_area = hull_surface_area
-internal_surface_area = haptera_surface_area
-total_surface_area    = haptera_surface_area - base_cap_area
-total_bounding_area   = external_surface_area + internal_surface_area
-sa_to_vol = internal_surface_area / interstitial_volume if interstitial_volume > 0 else 0
+interstitial_volume = hull_volume - final_vol
+total_surface_area  = haptera_surface_area - base_cap_area
+total_bounding_area = hull_surface_area + haptera_surface_area
+sa_to_vol           = total_surface_area / interstitial_volume if interstitial_volume > 0 else 0
 
 # ── output ────────────────────────────────────────────────────────────────────
 print(f"\nExported : {OUTPUT}")
@@ -589,7 +602,7 @@ print(f"")
 print(f"Haptera")
 print(f"  volume                 : {final_vol:.4f}")
 if TARGET_MODE == "volume":
-    print(f"  volume error           : {abs(final_vol - BASE_VOLUME) / BASE_VOLUME * 100:.3f}%")
+    print(f"  interstitial vol error : {abs(interstitial_volume - TARGET_INTERSTITIAL_VOLUME) / TARGET_INTERSTITIAL_VOLUME * 100:.3f}%")
 print(f"  surface area (w/ cap)  : {haptera_surface_area:.4f}  ({area_note})")
 print(f"  wetted surface area    : {total_surface_area:.4f}  (base cap excluded)")
 if TARGET_MODE == "surface_area":
@@ -607,8 +620,8 @@ print(f"  hull surface area      : {hull_surface_area:.4f}")
 print(f"")
 print(f"Interstitial space")
 print(f"  volume                 : {interstitial_volume:.4f}  (hull − haptera)")
-print(f"  external surface area  : {external_surface_area:.4f}  (hull surface)")
-print(f"  internal surface area  : {internal_surface_area:.4f}  (haptera surface)")
+print(f"  external surface area  : {hull_surface_area:.4f}  (hull surface)")
+print(f"  internal surface area  : {haptera_surface_area:.4f}  (haptera surface)")
 print(f"  total bounding area    : {total_bounding_area:.4f}    (Total surface area exlcluding bottom)")
 print(f"  SA / volume ratio      : {sa_to_vol:.4f}  (complexity index using Total surface area)")
 
