@@ -23,19 +23,18 @@ TESTING     = False  # True = matplotlib preview only, no mesh or export
 FAST_EXPORT = False  # True = export mesh without volume fitting or measurements
 DEBUG       = True  # True = print per-function timing diagnostics
 
-DEPTH  = 10 #Number of nodes
+DEPTH  = 9 #Number of nodes
 K      = 2 #Number of branches per node
 SHRINK = 1
-OUTPUT      = "haptera_d{}_k{}_s{}.stl".format(DEPTH, K, int(SHRINK * 100))
-TEXT_OUTPUT = OUTPUT.replace(".stl", ".txt")
+
 
 TUBE_SIDES = 10
 
 # ── convergence ───────────────────────────────────────────────────────────────
 TARGET_MODE = "volume"      # "volume"       → converge to TARGET_INTERSTITIAL_VOLUME
                             # "surface_area" → converge to TARGET_SURFACE_AREA
-TOLERANCE   = 0.001
-MAX_ITERS   = 10
+TOLERANCE   = 0.001 #0.1%
+MAX_ITERS   = 20
 
 # ── cone geometry ─────────────────────────────────────────────────────────────
 # Defined here so targets below can reference cone volume.
@@ -52,10 +51,12 @@ TORSION        = 0.6  # radians of extra branching-plane rotation per depth leve
 _CONE_VOLUME = (1.0 / 3.0) * np.pi * CONE_R**2 * CONE_H
 _NOMINAL_VOLUME = 2 * N_ROOTS * np.pi * REF_ROOT_R**2 * SEG_LEN  # original calibration
 
+OUTPUT      = "haptera_d{}_k{}_r{}_h{}.stl".format(DEPTH, K, CONE_R, CONE_H)
+TEXT_OUTPUT = OUTPUT.replace(".stl", ".txt")
 # ── targets ───────────────────────────────────────────────────────────────────
 # "volume" mode — desired void (interstitial) space inside the cone.
 # Default matches original formula so existing runs are unaffected.
-TARGET_INTERSTITIAL_VOLUME = 600 #_CONE_VOLUME - _NOMINAL_VOLUME   # adjust as needed
+TARGET_INTERSTITIAL_VOLUME = 600 #_CONE_VOLUME - _NOMINAL_VOLUME   # adjust as needed, 600 for 10 x 10
 
 # "surface_area" mode — desired wetted haptera surface area (base cap excluded).
 # Run once in volume mode first to see what surface area your tree naturally produces,
