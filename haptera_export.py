@@ -19,9 +19,9 @@ class Tee:
         sys.stdout = self.stdout
 
 # ── configuration ─────────────────────────────────────────────────────────────
-DEBUG       = True  # True = print per-function timing diagnostics
+DEBUG       = False  # True = print per-function timing diagnostics
 
-DEPTH  = 9
+DEPTH  = 6
  #Number of nodes
 K      = 2 #Number of branches per node
 
@@ -37,7 +37,7 @@ CONE_H = 100
 CONE_R = 100
 BOSS_R = 10   # radius of solid central boss cylinder (must be > HOLE_R); set to 0 to disable
 HOLE_R = 6    # radius of central through-hole drilled through the boss; set to 0 to disable
-SIMPLIFY_TARGET = 10000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
+SIMPLIFY_TARGET = 100000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
 
 N_ROOTS        = 40
 SEG_LEN        = CONE_H / DEPTH  # scales with cone height so branches traverse the full cone at any depth
@@ -428,6 +428,20 @@ for iteration in range(1, MAX_ITERS + 1):
     if _hole_manifold is not None:
         m_final = m_final - _hole_manifold
     combined_iter = _manifold_to_trimesh(m_final, _dlog)
+    # ── simplify before convergence check ─────────────────────────────────────
+    if SIMPLIFY_TARGET > 0 and len(combined_iter.faces) > SIMPLIFY_TARGET:
+        _n_before = len(combined_iter.faces)
+        _log(f"    [simplify] {_n_before} → ≤{SIMPLIFY_TARGET} faces...")
+        _ts = _time.perf_counter()
+        try:
+            _tr = max(0.0, min(1.0 - 1e-9, 1.0 - SIMPLIFY_TARGET / _n_before))
+            combined_iter = combined_iter.simplify_quadric_decimation(_tr)
+            if not combined_iter.is_watertight:
+                trimesh.repair.fill_holes(combined_iter)
+            _log(f"    [simplify] done  {_time.perf_counter()-_ts:.2f}s  "
+                 f"({_n_before} → {len(combined_iter.faces)} faces)")
+        except Exception as _e:
+            _log(f"    [simplify] failed ({_e}); using full-resolution mesh")
     _dlog(f"    [measure_hull] computing convex hull volume...")
     _tm = _time.perf_counter()
     hull_vol_iter = combined_iter.convex_hull.volume
@@ -443,7 +457,9 @@ for iteration in range(1, MAX_ITERS + 1):
         final_vol = final_vol_iter
         break
     # Correction steered on raw haptera volume (before boss/hole) since only tube radii are scaled.
-    haptera_target = hull_vol_iter - TARGET_INTERSTITIAL_VOLUME - (m_final.volume() - measured_vol)
+    # m_final.volume() = V(haptera+boss) - hole_volume, so (m_final.volume()-measured_vol) already
+    # bakes in -hole_volume; subtract it again to recover the correct net boss contribution.
+    haptera_target = hull_vol_iter - TARGET_INTERSTITIAL_VOLUME - (m_final.volume() - measured_vol) - hole_volume
     if haptera_target <= 0:
         haptera_target = BASE_VOLUME
     if haptera_target <= 0:
@@ -491,25 +507,6 @@ for iteration in range(1, MAX_ITERS + 1):
         final_vol = final_vol_iter
 if _ibar: _ibar.close()
 
-# ── mesh simplification ───────────────────────────────────────────────────────
-if SIMPLIFY_TARGET > 0 and len(combined.faces) > SIMPLIFY_TARGET:
-    _n_before = len(combined.faces)
-    print(f"\nSimplifying mesh ({_n_before} → ≤{SIMPLIFY_TARGET} faces)...")
-    _t = _time.perf_counter()
-    try:
-        combined = combined.simplify_quadric_decimation(SIMPLIFY_TARGET)
-    except Exception as _e:
-        print(f"  ! simplification failed ({_e}); exporting full-resolution mesh")
-    else:
-        if not combined.is_watertight:
-            trimesh.repair.fill_holes(combined)
-        final_vol = combined.volume
-        print(f"  done  {_time.perf_counter()-_t:.2f}s  "
-              f"({_n_before} → {len(combined.faces)} faces, "
-              f"ratio {len(combined.faces)/_n_before:.2f})")
-elif SIMPLIFY_TARGET > 0:
-    print(f"\nSkipping simplification — mesh already at {len(combined.faces)} faces "
-          f"(≤ target {SIMPLIFY_TARGET})")
 
 if DEBUG: print(f"[export] writing {OUTPUT}...")
 _t = _time.perf_counter()
@@ -563,6 +560,8 @@ print(f"  steer_onset            : {STEER_ONSET}")
 print(f"  steer_strength         : {STEER_STRENGTH}")
 print(f"  cone_h                 : {CONE_H}")
 print(f"  cone_r                 : {CONE_R}")
+print(f"  boss_r                 : {BOSS_R}")
+print(f"  hole_r                 : {HOLE_R}")
 print(f"  target_interstitial_vol: {TARGET_INTERSTITIAL_VOLUME:.4f}")
 print(f"  base_volume (haptera)  : {BASE_VOLUME:.4f}")
 print(f"")
