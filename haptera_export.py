@@ -21,7 +21,7 @@ class Tee:
 # ── configuration ─────────────────────────────────────────────────────────────
 DEBUG       = False  # True = print per-function timing diagnostics
 
-DEPTH  = 6
+DEPTH  = 3
  #Number of nodes
 K      = 2 #Number of branches per node
 
@@ -35,9 +35,14 @@ MAX_ITERS = 40
 # Defined here so targets below can reference cone volume.
 CONE_H = 100
 CONE_R = 100
-BOSS_R = 10   # radius of solid central boss cylinder (must be > HOLE_R); set to 0 to disable
-HOLE_R = 6    # radius of central through-hole drilled through the boss; set to 0 to disable
-SIMPLIFY_TARGET = 100000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
+VERT_BOSS_R  = 0   # radius of solid central vertical boss cylinder (must be > VERT_HOLE_R); set to 0 to disable
+VERT_HOLE_R  = 0   # radius of central vertical through-hole drilled through the boss; set to 0 to disable
+HORIZ_BOSS_R = 6   # outer radius of horizontal bossed cylinders that bisect the haptera; set to 0 to disable
+HORIZ_HOLE_R = 4   # inner bore radius of horizontal bossed cylinders; set to 0 to disable
+HORIZ_N      = 2   # number of horizontal cylinders: 1 = single centered cylinder, 2 = two at ±HORIZ_S/2
+HORIZ_S      = 60  # center-to-center spacing in Y between the two cylinders (ignored when HORIZ_N = 1)
+HORIZ_H      = 20  # height above the haptera base for horizontal cylinder centers
+SIMPLIFY_TARGET = 6000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
 
 N_ROOTS        = 40
 SEG_LEN        = CONE_H / DEPTH  # scales with cone height so branches traverse the full cone at any depth
@@ -62,6 +67,9 @@ TEXT_OUTPUT = OUTPUT.replace(".stl", ".txt")
 
 # ── PRNG ──────────────────────────────────────────────────────────────────────
 def make_rng(seed=54321):
+    """Create a deterministic pseudo-random number generator using a linear congruential
+    algorithm. Returns a closure that yields floats in [0, 1) on each call. Using a
+    fixed seed ensures the branching tree is reproducible across runs."""
     state = [seed & 0xFFFFFFFF]
     def rng():
         state[0] = (1664525 * state[0] + 1013904223) & 0xFFFFFFFF
@@ -70,6 +78,9 @@ def make_rng(seed=54321):
 
 # ── geometry helpers ──────────────────────────────────────────────────────────
 def cone_contains(x, y, z, r=0):
+    """Return True if the point (x, y, z) is inside the cone, accounting for tube
+    radius r. The skeleton centre must remain at least r from the cone wall so the
+    full tube cross-section stays within the cone boundary."""
     # r is the tube radius: the skeleton must stay at least r inside the cone wall
     # so the tube surface (skeleton ± r) fits within the cone.
     r_pos  = np.sqrt(x*x + y*y)
@@ -77,6 +88,10 @@ def cone_contains(x, y, z, r=0):
     return (z >= 0) and (z <= CONE_H) and (r_pos <= r_eff)
 
 def wall_proximity(x, y, z, r=0):
+    """Return the radial position of the skeleton as a fraction of the available
+    wall radius (cone wall radius minus tube radius r). A value of 0 means the
+    skeleton is on the axis; 1.0 means the tube surface is touching the cone wall;
+    values > 1.0 mean the tube is outside the cone."""
     # Returns skeleton position as a fraction of the effective wall radius (r_wall - r_tube).
     # At prox=1.0 the tube surface is exactly touching the cone wall.
     r_pos  = np.sqrt(x*x + y*y)
@@ -86,6 +101,10 @@ def wall_proximity(x, y, z, r=0):
     return r_pos / r_eff
 
 def inward_direction(x, y):
+    """Return a unit vector pointing inward along the cone wall normal from the
+    point (x, y). Accounts for the cone's slope so that branches redirected by
+    this vector will travel along the wall surface toward the apex rather than
+    purely horizontally. Returns a zero vector when already on the axis."""
     r = np.sqrt(x*x + y*y)
     if r < 1e-9:
         return np.array([0.0, 0.0, 0.0])
@@ -97,6 +116,10 @@ def inward_direction(x, y):
     return raw / np.linalg.norm(raw)
 
 def steer(dx, dy, dz, ox, oy, oz, r=0):
+    """Blend the branch direction (dx, dy, dz) toward the cone-wall inward normal
+    when the branch is close to the wall. Steering activates beyond STEER_ONSET
+    proximity and ramps up quadratically to STEER_STRENGTH at the wall, preventing
+    branches from escaping the cone boundary."""
     prox = wall_proximity(ox, oy, oz, r)
     if prox < STEER_ONSET:
         return dx, dy, dz
@@ -110,6 +133,13 @@ def steer(dx, dy, dz, ox, oy, oz, r=0):
     return ndx/nl, ndy/nl, ndz/nl
 
 def grow(ox, oy, oz, dx, dy, dz, r, depth, k, seg_len, rng, max_depth, out):
+    """Recursively grow a branching tree skeleton inside the cone. Each call extends
+    a single segment from origin (ox, oy, oz) in direction (dx, dy, dz) with tube
+    radius r. On reaching depth 0 the branch terminates; otherwise k child branches
+    are spawned at evenly-spaced azimuths with a random perturbation and TORSION
+    twist per depth level. Segments that would leave the cone are nudged inward or
+    discarded. Results are appended to the out list as dicts with keys start, end,
+    r, and level."""
     if not cone_contains(ox, oy, oz, r):
         return
     dx, dy, dz = steer(dx, dy, dz, ox, oy, oz, r)
@@ -153,10 +183,17 @@ def grow(ox, oy, oz, dx, dy, dz, r, depth, k, seg_len, rng, max_depth, out):
 
 # ── volume helpers ────────────────────────────────────────────────────────────
 def naive_volume(segs):
+    """Compute the total cylinder volume of all segments, ignoring overlap at
+    junctions. Used as a fast upper-bound estimate and as the V_naive term in
+    the cubic volume correction model."""
     return sum(np.pi * s['r']**2 * np.linalg.norm(s['end'] - s['start'])
                for s in segs)
 
 def overlap_volume(segs):
+    """Estimate the double-counted volume at branch junctions. At each shared
+    endpoint, every touching segment contributes a hemisphere (2/3 π r³), so two
+    overlapping hemispheres approximate the excess counted by the naive cylinder sum.
+    Returns the total estimated overlap to subtract from naive_volume."""
     junction = defaultdict(list)
     for s in segs:
         junction[tuple(np.round(s['start'], 6))].append(s['r'])
@@ -170,6 +207,8 @@ def overlap_volume(segs):
     return overlap
 
 def scale_radii(segs, factor):
+    """Multiply every segment's tube radius by factor in-place. Called each
+    iteration to converge the haptera volume toward the target."""
     for s in segs:
         s['r'] *= factor
 
@@ -209,6 +248,10 @@ def cubic_correction(V_naive, V_measured, V_target):
 
 # ── tube mesh builder ─────────────────────────────────────────────────────────
 def tube_mesh(start, end, radius, sides=8):
+    """Build a triangulated cylinder mesh aligned from start to end with the given
+    radius and number of lateral facets. Computes the rotation matrix that maps the
+    default Z-axis cylinder onto the segment direction using Rodrigues' formula.
+    Returns None if the segment is degenerate (zero length)."""
     direction = end - start
     length    = np.linalg.norm(direction)
     if length < 1e-6:
@@ -238,6 +281,11 @@ def tube_mesh(start, end, radius, sides=8):
     return geo
 
 def build_meshes(segs, sides):
+    """Convert a list of skeleton segments into trimesh geometry. For each segment a
+    cylinder mesh is created via tube_mesh, and an icosphere is placed at every
+    endpoint. The spheres fill the junction gaps between adjacent cylinders, preventing
+    the coincident flat end-caps that cause non-watertight booleans. Returns the list
+    of all component meshes ready for union."""
     meshes = []
     for s in segs:
         m = tube_mesh(s['start'], s['end'], s['r'], sides=sides)
@@ -341,6 +389,11 @@ def build_manifold(segs, sides):
 
 # ── segment builder ───────────────────────────────────────────────────────────
 def build_segments(depth, k):
+    """Generate the full skeleton of haptera segments for the given branching depth
+    and branching factor k. N_ROOTS evenly-spaced root branches are started from
+    near the cone apex, each grown recursively with grow(). After tree generation
+    the radii are rescaled so the naive volume approximation matches BASE_VOLUME,
+    providing a good starting point for the iterative volume convergence loop."""
     root_r = np.sqrt(BASE_VOLUME / (N_ROOTS * np.pi * SEG_LEN * (depth + 1)))
     rng    = make_rng(54321)
     segs   = []
@@ -373,28 +426,62 @@ else:
     print(f"  {len(segs)} segments generated")
 
 # ── hole volume correction (used in iteration error and final report) ─────────
-hole_volume       = np.pi * HOLE_R**2 * CONE_H if HOLE_R > 0 else 0.0
-hole_lateral_area = 2 * np.pi * HOLE_R * CONE_H if HOLE_R > 0 else 0.0
+hole_volume       = np.pi * VERT_HOLE_R**2 * CONE_H if VERT_HOLE_R > 0 else 0.0
+hole_lateral_area = 2 * np.pi * VERT_HOLE_R * CONE_H if VERT_HOLE_R > 0 else 0.0
 
 # ── boss/hole manifolds (pre-built once, reused each iteration) ───────────────
 from manifold3d import Manifold as _Manifold, Mesh as _MfdMesh
 
 def _trimesh_to_mfd(m):
+    """Convert a trimesh.Trimesh to a manifold3d Manifold object by copying vertex
+    and face arrays. Used to convert the pre-built boss and hole cylinders into the
+    Manifold CSG representation for reuse across iterations."""
     return _Manifold(mesh=_MfdMesh(
         vert_properties=m.vertices.astype(np.float32),
         tri_verts=m.faces.astype(np.uint32),
     ))
 
-_boss_manifold = None
-_hole_manifold = None
-if BOSS_R > 0:
-    _boss_cyl = trimesh.creation.cylinder(radius=BOSS_R, height=CONE_H, sections=64)
+_vert_boss_manifold  = None
+_vert_hole_manifold  = None
+# Horizontal boss and hole manifolds stored separately so they can be applied
+# with the correct CSG operations: boss uses (-boss + boss) to union a clean solid,
+# hole uses (-hole) to subtract.  Pre-combining them as an annular tube and then
+# subtracting would invert both operations (haptera - (outer-inner) = haptera - outer + inner).
+_horiz_boss_manifolds = []
+_horiz_hole_manifolds = []
+if VERT_BOSS_R > 0:
+    _boss_cyl = trimesh.creation.cylinder(radius=VERT_BOSS_R, height=CONE_H, sections=64)
     _boss_cyl.apply_translation([0.0, 0.0, CONE_H / 2.0])
-    _boss_manifold = _trimesh_to_mfd(_boss_cyl)
-if HOLE_R > 0:
-    _hole_cyl = trimesh.creation.cylinder(radius=HOLE_R, height=CONE_H * 3, sections=64)
+    _vert_boss_manifold = _trimesh_to_mfd(_boss_cyl)
+if VERT_HOLE_R > 0:
+    _hole_cyl = trimesh.creation.cylinder(radius=VERT_HOLE_R, height=CONE_H * 3, sections=64)
     _hole_cyl.apply_translation([0.0, 0.0, CONE_H / 2.0])
-    _hole_manifold = _trimesh_to_mfd(_hole_cyl)
+    _vert_hole_manifold = _trimesh_to_mfd(_hole_cyl)
+if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
+    # Horizontal cylinders are oriented along the X-axis, positioned at z = HORIZ_H.
+    # HORIZ_N=1 → single cylinder centered at y=0; HORIZ_N=2 → two at y=±HORIZ_S/2.
+    _rot_y90 = trimesh.transformations.rotation_matrix(np.pi / 2.0, [0, 1, 0])
+    _cone_r_at_horiz_h = CONE_R * (CONE_H - HORIZ_H) / CONE_H
+    _horiz_y_offsets = [0.0] if HORIZ_N == 1 else [+HORIZ_S / 2.0, -HORIZ_S / 2.0]
+    for _y_off in _horiz_y_offsets:
+        if HORIZ_BOSS_R > 0:
+            # Boss length = chord of the cone circle at height HORIZ_H for a line at y = y_off:
+            #   half_len = sqrt(cone_r² - y_off²)
+            # The boss centerline endpoints land exactly on the cone outline — no boolean
+            # intersection needed, and no dependency on manifold3d's intersection operator.
+            _boss_half_len = np.sqrt(max(_cone_r_at_horiz_h**2 - _y_off**2, 0.0))
+            _outer_cyl = trimesh.creation.cylinder(radius=HORIZ_BOSS_R, height=2.0 * _boss_half_len, sections=64)
+            _outer_cyl.apply_transform(_rot_y90)
+            _outer_cyl.apply_translation([0.0, _y_off, HORIZ_H])
+            _horiz_boss_manifolds.append(_trimesh_to_mfd(_outer_cyl))
+        if HORIZ_HOLE_R > 0:
+            # The bore is intentionally oversized (not clipped to the cone) so it punches
+            # cleanly through the boss without coplanar end-cap artefacts at the cone wall.
+            # This mirrors the VERT_HOLE_R pattern (3× height cylinder).
+            _inner_cyl = trimesh.creation.cylinder(radius=HORIZ_HOLE_R, height=2.2 * CONE_R, sections=64)
+            _inner_cyl.apply_transform(_rot_y90)
+            _inner_cyl.apply_translation([0.0, _y_off, HORIZ_H])
+            _horiz_hole_manifolds.append(_trimesh_to_mfd(_inner_cyl))
 
 print(f"\nIterating to interstitial volume (target={TARGET_INTERSTITIAL_VOLUME:.4f}, tol={TOLERANCE*100:.2f}%)...")
 try:
@@ -422,11 +509,20 @@ for iteration in range(1, MAX_ITERS + 1):
     measured_vol = manifold.volume()
     _dlog(f"    [measure_vol] done  {_time.perf_counter()-_tm:.4f}s  vol={measured_vol:.4f}")
     # Apply boss/hole to get the final-mesh manifold for this iteration.
+    # Subtract boss first to cleanly remove any haptera inside the boss region,
+    # then union the boss back in — this prevents interior haptera surfaces from
+    # persisting inside the boss, which would inflate the surface area calculation.
     m_final = manifold
-    if _boss_manifold is not None:
-        m_final = m_final + _boss_manifold
-    if _hole_manifold is not None:
-        m_final = m_final - _hole_manifold
+    if _vert_boss_manifold is not None:
+        m_final = m_final - _vert_boss_manifold  # purge haptera inside boss
+        m_final = m_final + _vert_boss_manifold  # add clean boss solid
+    if _vert_hole_manifold is not None:
+        m_final = m_final - _vert_hole_manifold
+    for _hboss in _horiz_boss_manifolds:
+        m_final = m_final - _hboss  # purge haptera inside boss region
+        m_final = m_final + _hboss  # add clean boss solid
+    for _hhole in _horiz_hole_manifolds:
+        m_final = m_final - _hhole  # drill the bore through haptera and boss
     combined_iter = _manifold_to_trimesh(m_final, _dlog)
     # ── simplify before convergence check ─────────────────────────────────────
     if SIMPLIFY_TARGET > 0 and len(combined_iter.faces) > SIMPLIFY_TARGET:
@@ -541,11 +637,45 @@ cone_volume       = (1.0 / 3.0) * np.pi * CONE_R**2 * CONE_H
 cone_lateral_area = np.pi * CONE_R * np.sqrt(CONE_R**2 + CONE_H**2)
 cone_base_area    = np.pi * CONE_R**2
 
+# ── horizontal cylinder analytical measurements ───────────────────────────────
+# Boss cylinders are ADDED (unioned) to the haptera → they contribute positive solid volume.
+# Bore cylinders are SUBTRACTED from the haptera → they displace (remove) material.
+# Displacement volume reported here is the net bore volume removed (×2 cylinders).
+# Surface area reported is the total new surface introduced: outer boss lateral walls +
+# annular end caps of the boss + inner bore lateral walls (the drilled channel surface).
+horiz_boss_vol      = 0.0  # solid volume added by boss cylinders
+horiz_bore_disp_vol = 0.0  # volume removed by bore cylinders
+horiz_tube_sa       = 0.0  # analytical surface area generated
+if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
+    _cone_r_at_h = CONE_R * (CONE_H - HORIZ_H) / CONE_H
+    # Each cylinder is clipped to the cone, so its effective chord length depends on its Y offset.
+    # Chord of the cone circle at height HORIZ_H for a line at y = y_off:
+    #   half_chord = sqrt(cone_r_at_h² - y_off²)  (0 if the cylinder misses the cone entirely)
+    _y_offsets  = [0.0] if HORIZ_N == 1 else [+HORIZ_S / 2.0, -HORIZ_S / 2.0]
+    _chord_lens = [2.0 * np.sqrt(max(_cone_r_at_h**2 - _yo**2, 0.0)) for _yo in _y_offsets]
+    if HORIZ_BOSS_R > 0:
+        _boss_solid_r_sq = HORIZ_BOSS_R**2 - (HORIZ_HOLE_R**2 if HORIZ_HOLE_R > 0 else 0.0)
+        horiz_boss_vol      = sum(np.pi * _boss_solid_r_sq * _cl for _cl in _chord_lens)
+        horiz_tube_sa      += sum(
+            2 * np.pi * HORIZ_BOSS_R * _cl + 2 * np.pi * _boss_solid_r_sq
+            for _cl in _chord_lens
+        )
+    if HORIZ_HOLE_R > 0:
+        horiz_bore_disp_vol = sum(np.pi * HORIZ_HOLE_R**2 * _cl for _cl in _chord_lens)
+        horiz_tube_sa      += sum(2 * np.pi * HORIZ_HOLE_R * _cl for _cl in _chord_lens)
+
 # ── interstitial measurements ─────────────────────────────────────────────────
-interstitial_volume = hull_volume - final_vol - hole_volume
-total_surface_area  = haptera_surface_area - base_cap_area - hole_lateral_area
+# Total interstitial: all void space inside the hull (includes bore channel volumes).
+# The bore walls are already in haptera_surface_area (they are mesh surfaces), and
+# the bore volumes are already captured in hull_volume - final_vol (final_vol is
+# reduced by drilling).  hole_volume / hole_lateral_area are kept only for the
+# convergence error check so it stays consistent with the calibration target.
+interstitial_volume = hull_volume - final_vol           # includes vert & horiz bore voids
+total_surface_area  = haptera_surface_area - base_cap_area  # includes all bore walls
 total_bounding_area = hull_surface_area + haptera_surface_area
 sa_to_vol           = total_surface_area / interstitial_volume if interstitial_volume > 0 else 0
+# Haptera-only interstitial (excludes vert bore) — used for error vs calibration target.
+interstitial_haptera_only = hull_volume - final_vol - hole_volume
 
 # ── output ────────────────────────────────────────────────────────────────────
 print(f"\nExported : {OUTPUT}")
@@ -560,8 +690,13 @@ print(f"  steer_onset            : {STEER_ONSET}")
 print(f"  steer_strength         : {STEER_STRENGTH}")
 print(f"  cone_h                 : {CONE_H}")
 print(f"  cone_r                 : {CONE_R}")
-print(f"  boss_r                 : {BOSS_R}")
-print(f"  hole_r                 : {HOLE_R}")
+print(f"  vert_boss_r            : {VERT_BOSS_R}")
+print(f"  vert_hole_r            : {VERT_HOLE_R}")
+print(f"  horiz_boss_r           : {HORIZ_BOSS_R}")
+print(f"  horiz_hole_r           : {HORIZ_HOLE_R}")
+print(f"  horiz_n                : {HORIZ_N}")
+print(f"  horiz_s                : {HORIZ_S}{'  (ignored — single cylinder)' if HORIZ_N == 1 else ''}")
+print(f"  horiz_h                : {HORIZ_H}")
 print(f"  target_interstitial_vol: {TARGET_INTERSTITIAL_VOLUME:.4f}")
 print(f"  base_volume (haptera)  : {BASE_VOLUME:.4f}")
 print(f"")
@@ -572,11 +707,20 @@ print(f"  faces                  : {len(combined.faces)}")
 print(f"")
 print(f"Haptera")
 print(f"  volume                 : {final_vol:.4f}")
-print(f"  interstitial vol error : {abs(interstitial_volume - TARGET_INTERSTITIAL_VOLUME) / TARGET_INTERSTITIAL_VOLUME * 100:.3f}%")
+print(f"  interstitial vol error : {abs(interstitial_haptera_only - TARGET_INTERSTITIAL_VOLUME) / TARGET_INTERSTITIAL_VOLUME * 100:.3f}%  (haptera-only vs calibration target)")
 print(f"  surface area (w/ cap)  : {haptera_surface_area:.4f}  ({area_note})")
-print(f"  wetted surface area    : {total_surface_area:.4f}  (base cap + hole wall excluded)")
+print(f"  wetted surface area    : {total_surface_area:.4f}  (base cap excluded; bore walls included)")
 print(f"  base cap area          : {base_cap_area:.4f}")
 print(f"")
+if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
+    _cyl_label = "single cylinder" if HORIZ_N == 1 else "both cylinders"
+    print(f"Horizontal cylinders (analytical, {_cyl_label})")
+    if HORIZ_BOSS_R > 0:
+        print(f"  boss solid vol added   : {horiz_boss_vol:.4f}  (annular solid unioned into haptera)")
+    if HORIZ_HOLE_R > 0:
+        print(f"  bore displacement vol  : {horiz_bore_disp_vol:.4f}  (volume drilled out of haptera+boss)")
+    print(f"  surface area           : {horiz_tube_sa:.4f}  (boss outer + end caps + bore walls)")
+    print(f"")
 print(f"Cone (design reference)")
 print(f"  total volume           : {cone_volume:.4f}")
 print(f"  lateral surface area   : {cone_lateral_area:.4f}")
@@ -587,10 +731,15 @@ print(f"  hull volume            : {hull_volume:.4f}")
 print(f"  hull surface area      : {hull_surface_area:.4f}")
 print(f"")
 print(f"Interstitial space")
-print(f"  volume                 : {interstitial_volume:.4f}  (hull − haptera − hole)")
+print(f"  volume (total)         : {interstitial_volume:.4f}  (hull − haptera; includes all bore voids)")
+print(f"  volume (haptera only)  : {interstitial_haptera_only:.4f}  (vert bore excluded; matches calibration target)")
+if hole_volume > 0:
+    print(f"  vert bore volume       : {hole_volume:.4f}  (VERT_HOLE contribution)")
+if HORIZ_HOLE_R > 0:
+    print(f"  horiz bore volume      : {horiz_bore_disp_vol:.4f}  (HORIZ_HOLE contribution, analytical)")
 print(f"  external surface area  : {hull_surface_area:.4f}  (hull surface)")
-print(f"  internal surface area  : {haptera_surface_area:.4f}  (haptera surface)")
-print(f"  total bounding area    : {total_bounding_area:.4f}    (Total surface area exlcluding bottom)")
-print(f"  SA / volume ratio      : {sa_to_vol:.4f}  (complexity index using Total surface area)")
+print(f"  internal surface area  : {haptera_surface_area:.4f}  (haptera surface; all bore walls included)")
+print(f"  total bounding area    : {total_bounding_area:.4f}  (total surface area excluding bottom)")
+print(f"  SA / volume ratio      : {sa_to_vol:.4f}  (complexity index using total wetted SA)")
 
 sys.stdout.close()
