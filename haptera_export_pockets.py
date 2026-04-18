@@ -43,6 +43,15 @@ HORIZ_S      = 60  # center-to-center spacing in Y between the two cylinders (ig
 HORIZ_H      = 30  # height above the haptera base for horizontal cylinder centers
 SIMPLIFY_TARGET = 6000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
 
+# ── interstitial pocket analysis ──────────────────────────────────────────────
+# POCKET_VOXEL_SIZE controls the spatial resolution of the voxel grid used to
+# identify and measure isolated void pockets.  Smaller values give more accurate
+# volumes and organism-size estimates but increase memory and runtime cubically.
+# At the default cone size (130 × 130 mm) a 1.0 mm voxel produces a ~135³ grid
+# (~2.5 M voxels), which completes in a few seconds on a modern workstation.
+# Halving the pitch (0.5 mm) increases the grid to ~270³ (~20 M voxels).
+POCKET_VOXEL_SIZE = 1.0   # mm per voxel; recommended range 0.5 – 2.0
+
 N_ROOTS        = 40
 SEG_LEN        = CONE_H / DEPTH  # scales with cone height so branches traverse the full cone at any depth
 REF_ROOT_R     = 5
@@ -688,6 +697,178 @@ sa_to_vol           = total_surface_area / interstitial_volume if interstitial_v
 # Haptera-only interstitial (excludes vert bore) — used for error vs calibration target.
 interstitial_haptera_only = hull_volume - final_vol - hole_volume
 
+# ── interstitial pocket analysis ──────────────────────────────────────────────
+#
+# Goal: decompose the total void space (hull − haptera) into isolated pockets
+# and quantify (a) how many pockets exist, (b) the volume of each pocket, and
+# (c) the size of organisms that can inhabit each pocket.
+#
+# The analysis runs in three stages:
+#
+# Stage 1 — Voxelisation
+#   Both the haptera mesh and its convex hull are rasterised onto a common
+#   axis-aligned grid at POCKET_VOXEL_SIZE resolution.  For each mesh a
+#   trimesh VoxelGrid is built (mesh.voxelized), and the world-space centres
+#   of its filled voxels are binned into a shared integer grid.  A voxel is
+#   classified as "void" when it lies inside the hull but outside the haptera.
+#   Trimesh's voxelizer uses a scanline ray-cast strategy equivalent to the
+#   method described in:
+#     Kaufman, A. (1987). An algorithm for 3D scan-conversion of polygons.
+#     Proc. Eurographics, pp. 197–208.
+#
+# Stage 2 — Connected-component labelling (CCL)
+#   scipy.ndimage.label is applied to the binary void mask with a full
+#   26-connected structuring element so that pockets touching only at a
+#   diagonal edge or corner are still counted as connected.  Each labelled
+#   region is a topologically isolated void pocket.
+#   Reference:
+#     Rosenfeld, A. & Pfaltz, J.L. (1966). Sequential operations in digital
+#     picture processing. Journal of the ACM, 13(4), 471–494.
+#     https://doi.org/10.1145/321356.321357
+#
+# Stage 3 — Euclidean distance transform (EDT) and inscribed sphere radius
+#   scipy.ndimage.distance_transform_edt assigns to every void voxel its
+#   Euclidean distance (mm) to the nearest non-void voxel, i.e. to the
+#   nearest solid surface.  For each pocket the maximum EDT value is the
+#   radius of the largest sphere that fits entirely inside that pocket without
+#   intersecting any solid — equivalently, the radius of the largest organism
+#   that can inhabit the pocket.  The mean EDT value gives the average
+#   accessible channel width.
+#   This maximum-EDT measure is the inscribed sphere radius derived from the
+#   medial axis of the void region:
+#     Blum, H. (1967). A transformation for extracting new descriptors of
+#     shape. In Models for the Perception of Speech and Visual Form (pp. 362–
+#     380). MIT Press.
+#   The linear-time EDT algorithm used by scipy is:
+#     Maurer, C.R., Qi, R. & Raghavan, V. (2003). A linear time algorithm for
+#     computing exact Euclidean distance transforms of binary images in
+#     arbitrary dimensions. IEEE Transactions on Pattern Analysis and Machine
+#     Intelligence, 25(2), 265–270.  https://doi.org/10.1109/TPAMI.2003.1177156
+
+if DEBUG: print(f"[pocket_analysis] starting at {POCKET_VOXEL_SIZE} mm/voxel...")
+_tp = _time.perf_counter()
+
+_pocket_analysis_ok = False
+_pocket_error       = ""
+
+try:
+    from scipy import ndimage as _ndi
+
+    _pitch = float(POCKET_VOXEL_SIZE)
+
+    # ── build a common integer grid aligned to the hull bounding box ──────────
+    # Add a 2-voxel border so no pocket is cut by the grid edge.
+    _bbox_min = haptera_hull.bounds[0] - _pitch * 2.0
+    _bbox_max = haptera_hull.bounds[1] + _pitch * 2.0
+    _dims     = np.ceil((_bbox_max - _bbox_min) / _pitch).astype(int) + 1
+
+    def _voxelize_to_grid(mesh, bbox_min, dims, pitch):
+        """Rasterise *mesh* into a pre-sized boolean numpy array.
+
+        Uses trimesh's VoxelGrid (scanline ray-cast) to find filled voxels,
+        then maps their world-space centres to the common grid defined by
+        bbox_min and pitch.  Points that fall outside dims are silently
+        discarded (only possible if the mesh extends beyond the hull + border,
+        which does not occur for the haptera or its hull).
+
+        Parameters
+        ----------
+        mesh     : trimesh.Trimesh
+        bbox_min : (3,) array — world-space origin of grid voxel [0,0,0]
+        dims     : (3,) int array — grid extents in voxels
+        pitch    : float — voxel side length (mm)
+
+        Returns
+        -------
+        grid : boolean ndarray of shape dims
+        """
+        vg      = mesh.voxelized(pitch)       # trimesh.voxel.VoxelGrid
+        centres = vg.points                   # (N, 3) world-space voxel centres
+        idx     = np.round((centres - bbox_min) / pitch).astype(int)
+        valid   = np.all((idx >= 0) & (idx < dims), axis=1)
+        idx     = idx[valid]
+        grid    = np.zeros(dims, dtype=bool)
+        if len(idx):
+            grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+        return grid
+
+    _solid_grid = _voxelize_to_grid(combined,     _bbox_min, _dims, _pitch)
+    _hull_grid  = _voxelize_to_grid(haptera_hull, _bbox_min, _dims, _pitch)
+
+    # void = inside hull AND outside haptera solid
+    _void_mask = _hull_grid & ~_solid_grid
+
+    if DEBUG:
+        print(f"[pocket_analysis] voxelisation done  {_time.perf_counter()-_tp:.2f}s  "
+              f"grid={tuple(_dims)}  void_voxels={int(_void_mask.sum())}")
+
+    # ── Stage 2: connected-component labelling ────────────────────────────────
+    # 26-connectivity (faces + edges + corners) ensures that narrow diagonal
+    # passages connecting two regions are treated as connected.
+    # See: Rosenfeld & Pfaltz (1966), JACM 13(4), doi:10.1145/321356.321357
+    _tc = _time.perf_counter()
+    _struct26          = _ndi.generate_binary_structure(3, 3)   # 26-connected
+    _labels, _n_pockets = _ndi.label(_void_mask, structure=_struct26)
+    if DEBUG:
+        print(f"[pocket_analysis] CCL done  {_time.perf_counter()-_tc:.2f}s  "
+              f"pockets={_n_pockets}")
+
+    # ── Stage 3: Euclidean distance transform ─────────────────────────────────
+    # EDT gives each void voxel its Euclidean distance (mm) to the nearest solid
+    # voxel.  sampling=_pitch converts from voxels to mm.
+    # Max EDT in a pocket = inscribed sphere radius (Blum 1967 medial axis).
+    # Algorithm: Maurer et al. (2003), IEEE TPAMI 25(2), doi:10.1109/TPAMI.2003.1177156
+    _te = _time.perf_counter()
+    _edt = _ndi.distance_transform_edt(_void_mask, sampling=_pitch)
+    if DEBUG:
+        print(f"[pocket_analysis] EDT done  {_time.perf_counter()-_te:.2f}s")
+
+    # ── per-pocket statistics ─────────────────────────────────────────────────
+    _voxel_vol   = _pitch ** 3   # mm³ per voxel
+
+    # Use ndimage.find_objects to iterate efficiently over labelled regions
+    # rather than looping over every voxel for each pocket.
+    _slices = _ndi.find_objects(_labels)   # list of slice tuples, one per label
+
+    pocket_stats = []
+    for _label_idx, _sl in enumerate(_slices, start=1):
+        if _sl is None:
+            continue
+        _region_labels = _labels[_sl]
+        _region_mask   = _region_labels == _label_idx
+        _region_edt    = _edt[_sl][_region_mask]
+        _n_vox         = int(_region_mask.sum())
+        pocket_stats.append({
+            'label':            _label_idx,
+            'voxels':           _n_vox,
+            'volume':           _n_vox * _voxel_vol,
+            'max_inscribed_r':  float(_region_edt.max()),    # largest organism radius
+            'mean_inscribed_r': float(_region_edt.mean()),   # mean accessible radius
+        })
+
+    # Largest pocket first
+    pocket_stats.sort(key=lambda p: p['volume'], reverse=True)
+
+    # Organism size bins keyed on max inscribed sphere radius (mm).
+    # Adjust bin edges to match your organism size classes.
+    _size_bin_edges  = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, float('inf')]
+    _size_bin_labels = ['< 0.5', '0.5 – 1', '1 – 2', '2 – 5', '5 – 10', '10 – 20', '> 20']
+    _bin_counts      = [0]   * len(_size_bin_labels)
+    _bin_volumes     = [0.0] * len(_size_bin_labels)
+    for _p in pocket_stats:
+        for _i, _edge in enumerate(_size_bin_edges):
+            if _p['max_inscribed_r'] < _edge:
+                _bin_counts[_i]  += 1
+                _bin_volumes[_i] += _p['volume']
+                break
+
+    _pocket_analysis_ok = True
+    if DEBUG:
+        print(f"[pocket_analysis] total  {_time.perf_counter()-_tp:.2f}s")
+
+except Exception as _pocket_exc:
+    _pocket_error = str(_pocket_exc)
+
 # ── output ────────────────────────────────────────────────────────────────────
 print(f"\nExported : {OUTPUT}")
 print(f"")
@@ -754,5 +935,37 @@ print(f"  external surface area  : {external_sa:.4f}  (hull surface + all bore w
 print(f"  internal surface area  : {internal_sa:.4f}  (haptera mesh; all bore walls included)")
 print(f"  total bounding area    : {total_bounding_area:.4f}  (external + internal; ground-contact faces excluded)")
 print(f"  SA / volume ratio      : {sa_to_vol:.4f}  (complexity index using total wetted SA)")
+print(f"")
+print(f"Interstitial pocket analysis")
+print(f"  method")
+print(f"    voxelisation         : trimesh.voxelized (scanline ray-cast; Kaufman 1987)")
+print(f"    pocket detection     : scipy.ndimage.label, 26-connectivity (Rosenfeld & Pfaltz 1966)")
+print(f"    organism size        : scipy.ndimage.distance_transform_edt, max inscribed sphere")
+print(f"                           radius (Blum 1967 medial axis; Maurer et al. 2003 algorithm)")
+if _pocket_analysis_ok:
+    _total_void_vol_vox = int(_void_mask.sum()) * _voxel_vol
+    print(f"  voxel size             : {POCKET_VOXEL_SIZE} mm  →  {_voxel_vol:.4f} mm³/voxel")
+    print(f"  grid dimensions        : {_dims[0]} × {_dims[1]} × {_dims[2]} voxels")
+    print(f"  void voxels            : {int(_void_mask.sum())}")
+    print(f"  void volume (voxelised): {_total_void_vol_vox:.2f} mm³"
+          f"  (cf. hull − haptera = {interstitial_volume:.2f} mm³)")
+    print(f"  isolated pockets       : {_n_pockets}")
+    print(f"")
+    print(f"  Organism size distribution  (max inscribed sphere radius in pocket, mm)")
+    print(f"  {'Radius bin (mm)':<16}  {'Pockets':>8}  {'Void vol (mm³)':>16}  {'% void vol':>11}")
+    _tvv = sum(p['volume'] for p in pocket_stats) or 1.0
+    for _lbl, _cnt, _bvol in zip(_size_bin_labels, _bin_counts, _bin_volumes):
+        _pct = 100.0 * _bvol / _tvv
+        print(f"  {_lbl:<16}  {_cnt:>8}  {_bvol:>16.2f}  {_pct:>10.1f}%")
+    print(f"")
+    _top_n = min(20, len(pocket_stats))
+    print(f"  Largest {_top_n} pockets by volume")
+    print(f"  {'Rank':<5}  {'Volume (mm³)':>14}  {'Max r (mm)':>11}  {'Mean r (mm)':>12}  {'Voxels':>8}")
+    for _ri, _p in enumerate(pocket_stats[:_top_n], 1):
+        print(f"  {_ri:<5}  {_p['volume']:>14.2f}  {_p['max_inscribed_r']:>11.3f}"
+              f"  {_p['mean_inscribed_r']:>12.3f}  {_p['voxels']:>8}")
+else:
+    print(f"  ! analysis failed: {_pocket_error}")
+    print(f"  Ensure scipy is installed:  pip install scipy")
 
 sys.stdout.close()
