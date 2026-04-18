@@ -62,6 +62,16 @@ def _parse_args():
                    help="Number of largest pockets to list (default 20).")
     p.add_argument("--debug",      action="store_true",
                    help="Print per-stage timing to stderr.")
+    p.add_argument("--chain",      action="store_true",
+                   help="Find a chain of touching inscribed spheres through the void.")
+    p.add_argument("--chain-max",  type=int,   default=50,  metavar="N",
+                   help="Maximum number of spheres in the chain (default 50).")
+    p.add_argument("--chain-tol",  type=float, default=2.0, metavar="VOXELS",
+                   help="Touching tolerance in voxels: |d − (r₁+r₂)| ≤ tol×pitch (default 2.0).")
+    p.add_argument("--plot",       action="store_true",
+                   help="Show an interactive 3-D plot of the sphere chain (implies --chain).")
+    p.add_argument("--plot-save",  metavar="FILE",
+                   help="Save the 3-D plot to FILE (.png/.svg/.pdf) instead of displaying it.")
     return p.parse_args()
 
 
@@ -114,10 +124,203 @@ def _voxelize_to_grid(mesh, bbox_min, dims, pitch):
     return grid
 
 
+# ── sphere chain ─────────────────────────────────────────────────────────────
+
+def _find_sphere_chain(void_mask, edt, pitch, bbox_min, max_spheres, tol_voxels):
+    """Find a greedy chain of externally-tangent inscribed spheres in the void.
+
+    Starting from the globally largest inscribed sphere (EDT maximum), each
+    subsequent sphere is chosen as the largest sphere that:
+
+      1. Is centred at a medial-axis voxel (local EDT maximum in a 3×3×3
+         neighbourhood), ensuring it is a valid maximal inscribed sphere.
+      2. Is externally tangent to the immediately preceding sphere:
+             |dist(c_prev, c_new) − (r_prev + r_new)| ≤ tol_voxels × pitch
+      3. Does not intersect any sphere already in the chain:
+             dist(c_i, c_new) ≥ r_i + r_new  for all i.
+
+    Parameters
+    ----------
+    void_mask  : bool ndarray (dims)       — True where space is free
+    edt        : float ndarray (dims)      — Euclidean distance transform (mm)
+    pitch      : float                     — voxel side length (mm)
+    bbox_min   : (3,) array                — world-space origin of voxel [0,0,0]
+    max_spheres: int                       — chain length cap
+    tol_voxels : float                     — touching tolerance in voxels
+
+    Returns
+    -------
+    list of dict  {'center': ndarray(3,) mm,  'radius': float mm}
+    """
+    from scipy import ndimage as ndi
+
+    # Medial-axis candidates: voxels where EDT equals the 3×3×3 neighbourhood
+    # maximum, i.e. locally largest inscribed spheres.
+    edt_lmax  = ndi.maximum_filter(edt, size=3, mode='constant', cval=0.0)
+    cand_mask = void_mask & (edt > 0) & (edt == edt_lmax)
+
+    cand_coords = np.argwhere(cand_mask)          # (M, 3) voxel indices
+    if len(cand_coords) == 0:
+        return []
+
+    cand_world = cand_coords * pitch + bbox_min   # (M, 3) world-space centres
+    cand_r     = edt[cand_mask]                   # (M,)   sphere radii (mm)
+
+    tol = tol_voxels * pitch                      # touching tolerance (mm)
+
+    # ── seed: globally largest inscribed sphere ───────────────────────────────
+    start = int(np.argmax(cand_r))
+    chain = [{'center': cand_world[start].copy(), 'radius': float(cand_r[start])}]
+
+    # Mark unavailable: candidates whose sphere would intersect the seed.
+    # The touching sphere sits exactly at dist = r_seed + r_cand (boundary),
+    # so the strict-less-than keeps touching candidates available.
+    d0        = np.linalg.norm(cand_world - chain[0]['center'], axis=1)
+    available = d0 >= chain[0]['radius'] + cand_r
+    available[start] = False  # do not re-select the seed itself
+
+    # ── greedy extension ──────────────────────────────────────────────────────
+    for _ in range(max_spheres - 1):
+        prev_c = chain[-1]['center']
+        prev_r = chain[-1]['radius']
+
+        av_idx = np.where(available)[0]
+        if len(av_idx) == 0:
+            break
+
+        d    = np.linalg.norm(cand_world[av_idx] - prev_c, axis=1)
+        r_av = cand_r[av_idx]
+
+        # Touching condition
+        touch = np.abs(d - (prev_r + r_av)) <= tol
+        if not touch.any():
+            break
+
+        # Pick the touching candidate with the largest radius
+        touching_global = av_idx[touch]
+        best = touching_global[int(np.argmax(cand_r[touching_global]))]
+
+        new_c = cand_world[best].copy()
+        new_r = float(cand_r[best])
+        chain.append({'center': new_c, 'radius': new_r})
+
+        # Exclude from future steps: anything that would intersect the new sphere
+        d_new = np.linalg.norm(cand_world - new_c, axis=1)
+        available[d_new < new_r + cand_r] = False
+        available[best] = False
+
+    return chain
+
+
+# ── visualisation ─────────────────────────────────────────────────────────────
+
+def _visualize_chain(sphere_chain, hull, mesh_path, pitch, save_path=None):
+    """Render the sphere chain in a 3-D matplotlib figure.
+
+    Shows the convex hull as a faint semi-transparent context shell, the
+    sphere chain as coloured translucent spheres (colour = inscribed radius),
+    and a centre-to-centre spine line.
+
+    Parameters
+    ----------
+    sphere_chain : list of dict  {'center': ndarray(3,), 'radius': float}
+    hull         : trimesh.Trimesh  — convex hull for spatial context
+    mesh_path    : Path             — used for the figure title
+    pitch        : float            — voxel size (mm), shown in title
+    save_path    : Path or None     — if given, save there; else plt.show()
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection   # noqa: F401
+    except ImportError:
+        print("  ! matplotlib not available — install it with:  pip install matplotlib",
+              file=sys.stderr)
+        return
+
+    fig = plt.figure(figsize=(11, 8))
+    ax  = fig.add_subplot(111, projection='3d')
+
+    # ── convex hull shell (spatial context) ───────────────────────────────────
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    hull_tris = hull.vertices[hull.faces]          # (F, 3, 3)
+    hull_poly = Poly3DCollection(
+        hull_tris,
+        alpha=0.06, facecolor='steelblue',
+        edgecolor='steelblue', linewidth=0.15)
+    ax.add_collection3d(hull_poly)
+
+    # ── sphere surfaces ───────────────────────────────────────────────────────
+    # Low-res parametric sphere grid (fast enough for ≤ 100 spheres)
+    u = np.linspace(0, 2 * np.pi, 28)
+    v = np.linspace(0,     np.pi, 18)
+    base_x = np.outer(np.cos(u), np.sin(v))   # (28, 18)
+    base_y = np.outer(np.sin(u), np.sin(v))
+    base_z = np.outer(np.ones_like(u), np.cos(v))
+
+    radii = np.array([s['radius'] for s in sphere_chain])
+    r_min, r_max = radii.min(), radii.max()
+    cmap  = plt.cm.plasma
+    norm  = plt.Normalize(r_min, r_max)
+
+    for s in sphere_chain:
+        cx, cy, cz = s['center']
+        r = s['radius']
+        color = cmap(norm(r))
+        ax.plot_surface(
+            cx + r * base_x,
+            cy + r * base_y,
+            cz + r * base_z,
+            color=color, alpha=0.40,
+            linewidth=0, antialiased=False)
+
+    # ── centre-to-centre spine ────────────────────────────────────────────────
+    centers = np.array([s['center'] for s in sphere_chain])
+    ax.plot(centers[:, 0], centers[:, 1], centers[:, 2],
+            color='k', linewidth=1.4, alpha=0.75, zorder=5)
+    ax.scatter(centers[:, 0], centers[:, 1], centers[:, 2],
+               c='k', s=18, zorder=6)
+
+    # Label first and last sphere
+    for idx, label in ((0, f"S1\nr={sphere_chain[0]['radius']:.2f} mm"),
+                       (-1, f"S{len(sphere_chain)}\nr={sphere_chain[-1]['radius']:.2f} mm")):
+        cx, cy, cz = sphere_chain[idx]['center']
+        ax.text(cx, cy, cz, label, fontsize=7, ha='center', va='bottom')
+
+    # ── axes, labels, colorbar ────────────────────────────────────────────────
+    b = hull.bounds
+    ax.set_xlim(b[0, 0], b[1, 0])
+    ax.set_ylim(b[0, 1], b[1, 1])
+    ax.set_zlim(b[0, 2], b[1, 2])
+    ax.set_xlabel('X (mm)', labelpad=6)
+    ax.set_ylabel('Y (mm)', labelpad=6)
+    ax.set_zlabel('Z (mm)', labelpad=6)
+    ax.set_title(
+        f'{mesh_path.name} — sphere chain\n'
+        f'{len(sphere_chain)} spheres · voxel {pitch} mm',
+        fontsize=9)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax, shrink=0.55, pad=0.10,
+                      label='Inscribed radius (mm)')
+    cb.ax.tick_params(labelsize=8)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Plot saved to: {save_path}", file=sys.stderr)
+    else:
+        plt.show()
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args  = _parse_args()
+    # --plot / --plot-save imply --chain
+    if args.plot or args.plot_save:
+        args.chain = True
     pitch = float(args.voxel_size)
     debug = args.debug
     dlog  = (lambda msg: print(msg, file=sys.stderr)) if debug else (lambda _: None)
@@ -222,6 +425,20 @@ def main():
     except Exception as exc:
         pocket_error = str(exc)
 
+    # ── sphere chain ──────────────────────────────────────────────────────────
+    sphere_chain = []
+    if args.chain and pocket_analysis_ok:
+        print(f"Finding sphere chain (max {args.chain_max} spheres, "
+              f"tol {args.chain_tol} voxels)...")
+        t0 = time.perf_counter()
+        sphere_chain = _find_sphere_chain(
+            void_mask, edt, pitch, bbox_min,
+            max_spheres=args.chain_max,
+            tol_voxels=args.chain_tol,
+        )
+        dlog(f"  sphere chain  {time.perf_counter()-t0:.2f}s  "
+             f"spheres={len(sphere_chain)}")
+
     # ── organism size bins ────────────────────────────────────────────────────
     size_bin_edges  = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, float('inf')]
     size_bin_labels = ['< 0.5', '0.5 – 1', '1 – 2', '2 – 5', '5 – 10', '10 – 20', '> 20']
@@ -298,8 +515,67 @@ def main():
         print(f"  ! analysis failed: {pocket_error}")
         print(f"  Ensure scipy is installed:  pip install scipy")
 
+    if args.chain:
+        print(f"")
+        print(f"Sphere chain  (touching inscribed spheres through the void)")
+        print(f"  method       : greedy from global EDT maximum; each sphere externally")
+        print(f"                 tangent to the previous, non-intersecting with all prior")
+        print(f"  candidates   : medial-axis voxels (3×3×3 local EDT maxima)")
+        print(f"  tolerance    : {args.chain_tol} voxels = {args.chain_tol * pitch:.3f} mm")
+        if not pocket_analysis_ok:
+            print(f"  ! skipped — pocket analysis did not complete")
+        elif not sphere_chain:
+            print(f"  ! no chain found (void may be empty or fully disconnected)")
+        else:
+            total_chain_len = sum(
+                float(np.linalg.norm(sphere_chain[i+1]['center'] - sphere_chain[i]['center']))
+                for i in range(len(sphere_chain) - 1)
+            )
+            print(f"  spheres found : {len(sphere_chain)}")
+            print(f"  path length   : {total_chain_len:.3f} mm  (centre-to-centre sum)")
+            print(f"  largest r     : {sphere_chain[0]['radius']:.3f} mm  (sphere 1, seed)")
+            print(f"  smallest r    : {min(s['radius'] for s in sphere_chain):.3f} mm")
+            print(f"")
+            print(f"  {'#':<5}  {'cx (mm)':>10}  {'cy (mm)':>10}  {'cz (mm)':>10}"
+                  f"  {'r (mm)':>9}  {'gap to prev (mm)':>17}")
+            for i, s in enumerate(sphere_chain):
+                cx, cy, cz = s['center']
+                if i == 0:
+                    gap_str = "       —"
+                else:
+                    d = float(np.linalg.norm(s['center'] - sphere_chain[i-1]['center']))
+                    gap = d - (sphere_chain[i-1]['radius'] + s['radius'])
+                    gap_str = f"{gap:+.3f}"
+                print(f"  {i+1:<5}  {cx:>10.3f}  {cy:>10.3f}  {cz:>10.3f}"
+                      f"  {s['radius']:>9.3f}  {gap_str:>17}")
+
+            # Write CSV alongside the mesh file
+            chain_csv = mesh_path.with_name(
+                mesh_path.stem + f"_chain{pitch}mm.csv")
+            with open(chain_csv, "w") as cf:
+                cf.write("sphere,cx_mm,cy_mm,cz_mm,radius_mm,gap_to_prev_mm\n")
+                for i, s in enumerate(sphere_chain):
+                    cx, cy, cz = s['center']
+                    if i == 0:
+                        gap = ""
+                    else:
+                        d = float(np.linalg.norm(s['center'] - sphere_chain[i-1]['center']))
+                        gap = f"{d - sphere_chain[i-1]['radius'] - s['radius']:.4f}"
+                    cf.write(f"{i+1},{cx:.4f},{cy:.4f},{cz:.4f},"
+                             f"{s['radius']:.4f},{gap}\n")
+            print(f"")
+            print(f"  Chain CSV: {chain_csv}")
+
     tee.close()
     print(f"\nReport written to: {out_path}", file=sys.stderr)
+
+    # ── 3-D visualisation ─────────────────────────────────────────────────────
+    if args.plot or args.plot_save:
+        if not sphere_chain:
+            print("  ! Nothing to plot — sphere chain is empty.", file=sys.stderr)
+        else:
+            save = Path(args.plot_save) if args.plot_save else None
+            _visualize_chain(sphere_chain, hull, mesh_path, pitch, save_path=save)
 
 
 if __name__ == "__main__":
