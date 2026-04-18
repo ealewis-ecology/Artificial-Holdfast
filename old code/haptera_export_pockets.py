@@ -50,7 +50,7 @@ SIMPLIFY_TARGET = 6000000  # target face count after QEM decimation (e.g. 50000)
 # At the default cone size (130 × 130 mm) a 1.0 mm voxel produces a ~135³ grid
 # (~2.5 M voxels), which completes in a few seconds on a modern workstation.
 # Halving the pitch (0.5 mm) increases the grid to ~270³ (~20 M voxels).
-POCKET_VOXEL_SIZE = 1.0   # mm per voxel; recommended range 0.5 – 2.0
+POCKET_VOXEL_SIZE = 0.5   # mm per voxel; recommended range 0.5 – 2.0
 
 N_ROOTS        = 40
 SEG_LEN        = CONE_H / DEPTH  # scales with cone height so branches traverse the full cone at any depth
@@ -69,9 +69,118 @@ TARGET_INTERSTITIAL_FRACTION = 0.747920635
 # Haptera mesh volume fallback (used when dynamic target is infeasible):
 BASE_VOLUME = _CONE_VOLUME * (1 - TARGET_INTERSTITIAL_FRACTION)
 
-OUTPUT      = "haptera_d{}_k{}_r{}_h{}_f{}.stl".format(DEPTH, K, CONE_R, CONE_H,
-                                                        round(TARGET_INTERSTITIAL_FRACTION * 1000))
+OUTPUT      = (
+    "haptera"
+    "_d{}_k{}_r{}_h{}_f{}"
+    "_nr{}_ts{}"
+    "_vb{}_vr{}"
+    "_hb{}_hr{}_hn{}hs{}hh{}"
+    "_to{}_so{}_ss{}"
+    ".stl"
+).format(
+    DEPTH, K, CONE_R, CONE_H, round(TARGET_INTERSTITIAL_FRACTION * 1000),
+    N_ROOTS, TUBE_SIDES,
+    VERT_BOSS_R, VERT_HOLE_R,
+    HORIZ_BOSS_R, HORIZ_HOLE_R, HORIZ_N, round(HORIZ_S), round(HORIZ_H),
+    round(TORSION * 100), round(STEER_ONSET * 100), round(STEER_STRENGTH * 100),
+)
 TEXT_OUTPUT = OUTPUT.replace(".stl", ".txt")
+
+# ── convergence cache ─────────────────────────────────────────────────────────
+# When the volume iteration loop converges, the cumulative scale factor applied
+# to tube radii (on top of the initial build_segments scaling) is saved to a CSV
+# alongside all geometry-affecting parameters.  On the next run with identical
+# parameters the cached factor is applied immediately after build_segments, and
+# a single verification iteration confirms convergence — skipping all iteration.
+import csv as _csv
+import os  as _os
+
+CACHE_FILE = "haptera_cache.csv"
+
+# All parameters that uniquely determine the converged scale factor.
+_CACHE_KEY_FIELDS = [
+    'DEPTH', 'K', 'N_ROOTS', 'CONE_H', 'CONE_R', 'SEG_LEN',
+    'TUBE_SIDES', 'STEER_ONSET', 'STEER_STRENGTH', 'TORSION',
+    'VERT_BOSS_R', 'VERT_HOLE_R',
+    'HORIZ_BOSS_R', 'HORIZ_HOLE_R', 'HORIZ_N', 'HORIZ_S', 'HORIZ_H',
+    'TARGET_INTERSTITIAL_FRACTION', 'TOLERANCE', 'SIMPLIFY_TARGET',
+]
+
+def _current_params():
+    """Return a dict of current parameter values (all as strings for CSV round-trip)."""
+    return {
+        'DEPTH':                       str(DEPTH),
+        'K':                           str(K),
+        'N_ROOTS':                     str(N_ROOTS),
+        'CONE_H':                      str(CONE_H),
+        'CONE_R':                      str(CONE_R),
+        'SEG_LEN':                     str(SEG_LEN),
+        'TUBE_SIDES':                  str(TUBE_SIDES),
+        'STEER_ONSET':                 str(STEER_ONSET),
+        'STEER_STRENGTH':              str(STEER_STRENGTH),
+        'TORSION':                     str(TORSION),
+        'VERT_BOSS_R':                 str(VERT_BOSS_R),
+        'VERT_HOLE_R':                 str(VERT_HOLE_R),
+        'HORIZ_BOSS_R':                str(HORIZ_BOSS_R),
+        'HORIZ_HOLE_R':                str(HORIZ_HOLE_R),
+        'HORIZ_N':                     str(HORIZ_N),
+        'HORIZ_S':                     str(HORIZ_S),
+        'HORIZ_H':                     str(HORIZ_H),
+        'TARGET_INTERSTITIAL_FRACTION': str(TARGET_INTERSTITIAL_FRACTION),
+        'TOLERANCE':                   str(TOLERANCE),
+        'SIMPLIFY_TARGET':             str(SIMPLIFY_TARGET),
+    }
+
+def _lookup_cache():
+    """Return the cached cumulative_factor for the current parameters, or None.
+
+    Only returns a value when the stored row has converged=True and every
+    key field matches exactly (string comparison after CSV round-trip)."""
+    if not _os.path.exists(CACHE_FILE):
+        return None
+    params = _current_params()
+    try:
+        with open(CACHE_FILE, newline='') as _f:
+            for row in _csv.DictReader(_f):
+                if (row.get('converged', '').lower() == 'true'
+                        and all(row.get(k, '') == params[k] for k in _CACHE_KEY_FIELDS)):
+                    return float(row['cumulative_factor'])
+    except Exception:
+        pass
+    return None
+
+def _save_cache(cumulative_factor, iterations):
+    """Write or update the cache row for the current parameters.
+
+    If a matching row already exists it is updated in-place; otherwise a new
+    row is appended.  The file is rewritten atomically (full read-modify-write)
+    so partial updates are not visible to concurrent readers."""
+    params    = _current_params()
+    all_fields = _CACHE_KEY_FIELDS + ['cumulative_factor', 'converged', 'iterations']
+    rows  = []
+    found = False
+    if _os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, newline='') as _f:
+                for row in _csv.DictReader(_f):
+                    if all(row.get(k, '') == params[k] for k in _CACHE_KEY_FIELDS):
+                        row['cumulative_factor'] = str(cumulative_factor)
+                        row['converged']         = 'True'
+                        row['iterations']        = str(iterations)
+                        found = True
+                    rows.append(row)
+        except Exception:
+            rows = []
+    if not found:
+        new_row = dict(params)
+        new_row['cumulative_factor'] = str(cumulative_factor)
+        new_row['converged']         = 'True'
+        new_row['iterations']        = str(iterations)
+        rows.append(new_row)
+    with open(CACHE_FILE, 'w', newline='') as _f:
+        writer = _csv.DictWriter(_f, fieldnames=all_fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # ── PRNG ──────────────────────────────────────────────────────────────────────
@@ -506,10 +615,18 @@ _dlog = _log if DEBUG else (lambda _: None)
 combined          = None
 final_vol         = None
 prev_error        = float('inf')
-cumulative_factor = 1.0
 lo_factor = None
 hi_factor = None
 damping   = 1.0
+
+_cached_factor = _lookup_cache()
+if _cached_factor is not None:
+    _log(f"  cache hit: pre-applying cumulative_factor={_cached_factor:.8f}  (will verify in 1 iteration)...")
+    scale_radii(segs, _cached_factor)
+    cumulative_factor = _cached_factor
+else:
+    cumulative_factor = 1.0
+
 for iteration in range(1, MAX_ITERS + 1):
     _dlog(f"  ── iter {iteration} ──────────────────────────────")
     manifold = build_manifold(segs, TUBE_SIDES)
@@ -558,7 +675,11 @@ for iteration in range(1, MAX_ITERS + 1):
     error = abs(interstitial_iter - _target_interstitial) / _target_interstitial
     msg   = f"  iter {iteration}: interstitial={interstitial_iter:.4f}  haptera={final_vol_iter:.4f}  error={error*100:.3f}%"
     if error <= TOLERANCE:
-        _log(msg + "  ✓ converged")
+        if _cached_factor is not None and iteration == 1:
+            _log(msg + "  ✓ cache verified")
+        else:
+            _log(msg + "  ✓ converged")
+            _save_cache(cumulative_factor, iteration)
         if _ibar: _ibar.update(1)
         combined  = combined_iter
         final_vol = final_vol_iter
