@@ -20,8 +20,9 @@ class Tee:
 
 # ── configuration ─────────────────────────────────────────────────────────────
 DEBUG       = False  # True = print per-function timing diagnostics
+INTERTWINED = False  # True = roots spiral down the cone on helical lanes (see intertwining parameters below)
 
-DEPTH  = 3 #Number of nodes
+DEPTH  = 6 #Number of nodes
 K      = 2 #Number of branches per node
 
 TUBE_SIDES = 10
@@ -34,11 +35,11 @@ MAX_ITERS = 40
 # Defined here so targets below can reference cone volume.
 CONE_H = 130
 CONE_R = 130
-VERT_BOSS_R  = 9   # radius of solid central vertical boss cylinder (must be > VERT_HOLE_R); set to 0 to disable
-VERT_HOLE_R  = 6   # radius of central vertical through-hole drilled through the boss; set to 0 to disable
-HORIZ_BOSS_R = 6   # outer radius of horizontal bossed cylinders that bisect the haptera; set to 0 to disable
-HORIZ_HOLE_R = 4   # inner bore radius of horizontal bossed cylinders; set to 0 to disable
-HORIZ_N      = 2   # number of horizontal cylinders: 1 = single centered cylinder, 2 = two at ±HORIZ_S/2
+VERT_BOSS_R  = 0   # radius of solid central vertical boss cylinder (must be > VERT_HOLE_R); set to 0 to disable
+VERT_HOLE_R  = 0   # radius of central vertical through-hole drilled through the boss; set to 0 to disable
+HORIZ_BOSS_R = 0   # outer radius of horizontal bossed cylinders that bisect the haptera; set to 0 to disable
+HORIZ_HOLE_R = 0   # inner bore radius of horizontal bossed cylinders; set to 0 to disable
+HORIZ_N      = 0   # number of horizontal cylinders: 1 = single centered cylinder, 2 = two at ±HORIZ_S/2
 HORIZ_S      = 60  # center-to-center spacing in Y between the two cylinders (ignored when HORIZ_N = 1)
 HORIZ_H      = 30  # height above the haptera base for horizontal cylinder centers
 SIMPLIFY_TARGET = 6000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
@@ -50,6 +51,23 @@ STEER_ONSET    = 0.90  # was 0.55; lower values pull branches inward too early, 
 STEER_STRENGTH = 1.1
 TORSION        = 0.6  # radians of extra branching-plane rotation per depth level (0 = no twist)
 
+# ── intertwining (only used when INTERTWINED = True) ──────────────────────────
+# Each root traces a helical path from apex to base, steered by a lane-specific
+# parametric helix.  NO_INTERSECT (below) still enforces non-overlap between
+# lanes, so the result is a set of intertwined, non-intersecting strands.
+HELIX_TURNS     = 0.5   # full rotations around the cone axis from apex to base
+RADIAL_FRACTION = 0.65  # helix radius as a fraction of the available cone radius
+LANE_BIAS       = 0.10  # strength each branch is pulled toward its helical waypoint
+
+# ── inter-haptera collision avoidance ─────────────────────────────────────────
+# When NO_INTERSECT is True, each branch checks every already-placed segment
+# and deflects laterally to avoid overlap.  Branches that still intersect after
+# REPEL_RETRIES attempts are silently discarded.
+NO_INTERSECT   = False  # True = haptera steer around each other
+REPEL_ONSET    = 1.5    # repulsion zone starts at this multiple of (r_a + r_b)
+REPEL_STRENGTH = 2.5    # lateral deflection weight at full proximity
+REPEL_RETRIES  = 12     # direction-correction attempts before discarding a branch
+
 _CONE_VOLUME = (1.0 / 3.0) * np.pi * CONE_R**2 * CONE_H
 _NOMINAL_VOLUME = 2 * N_ROOTS * np.pi * REF_ROOT_R**2 * SEG_LEN  # original calibration
 
@@ -60,8 +78,10 @@ TARGET_INTERSTITIAL_FRACTION = 0.747920635
 # Haptera mesh volume fallback (used when dynamic target is infeasible):
 BASE_VOLUME = _CONE_VOLUME * (1 - TARGET_INTERSTITIAL_FRACTION)
 
-OUTPUT      = "haptera_d{}_k{}_r{}_h{}_f{}.stl".format(DEPTH, K, CONE_R, CONE_H,
-                                                        round(TARGET_INTERSTITIAL_FRACTION * 1000))
+OUTPUT      = "haptera_{}d{}_k{}_r{}_h{}_f{}.stl".format(
+                "intertwined_" if INTERTWINED else "",
+                DEPTH, K, CONE_R, CONE_H,
+                round(TARGET_INTERSTITIAL_FRACTION * 1000))
 TEXT_OUTPUT = OUTPUT.replace(".stl", ".txt")
 
 
@@ -115,6 +135,65 @@ def inward_direction(x, y):
     raw = np.array([-x / r, -y / r, -slope])
     return raw / np.linalg.norm(raw)
 
+def helix_target_direction(ox, oy, oz, lane, n_lanes, seg_len):
+    """Return a unit vector from (ox, oy, oz) toward the next waypoint on lane's
+    parametric helix. Each lane traces a helix from the apex (z=CONE_H) to the
+    base (z=0), completing HELIX_TURNS full rotations. The helix radius at height
+    z is RADIAL_FRACTION × the cone radius at that height, so the helix always
+    sits comfortably inside the cone. Used only when INTERTWINED is True."""
+    z_target = max(0.0, oz - seg_len)
+    z_frac_t = max(0.0, min(1.0, (CONE_H - z_target) / CONE_H))
+    phi_t    = 2.0 * np.pi * lane / n_lanes + HELIX_TURNS * 2.0 * np.pi * z_frac_t
+    cone_r_t = (CONE_R / CONE_H) * (CONE_H - z_target)
+    tx = RADIAL_FRACTION * cone_r_t * np.cos(phi_t) - ox
+    ty = RADIAL_FRACTION * cone_r_t * np.sin(phi_t) - oy
+    tz = z_target - oz
+    length = np.sqrt(tx*tx + ty*ty + tz*tz)
+    if length < 1e-9:
+        return np.array([0.0, 0.0, -1.0])
+    return np.array([tx / length, ty / length, tz / length])
+
+def _seg_seg_closest(p1, p2, p3, p4):
+    """Minimum centre-to-centre distance between finite segments p1→p2 and p3→p4.
+
+    Returns (distance, point_on_p1p2, point_on_p3p4).
+    Implements Ericson (2005) 'Real-Time Collision Detection' §5.1.9.
+    """
+    d1  = p2 - p1
+    d2  = p4 - p3
+    r   = p1 - p3
+    a   = np.dot(d1, d1)   # squared length of seg 1
+    e   = np.dot(d2, d2)   # squared length of seg 2
+    f   = np.dot(d2, r)
+    EPS = 1e-10
+
+    if a <= EPS and e <= EPS:          # both point-degenerate
+        return float(np.sqrt(max(np.dot(r, r), 0.0))), p1.copy(), p3.copy()
+
+    if a <= EPS:                       # seg 1 degenerate
+        s = 0.0
+        t = float(np.clip(f / e, 0.0, 1.0))
+    else:
+        c = np.dot(d1, r)
+        if e <= EPS:                   # seg 2 degenerate
+            t = 0.0
+            s = float(np.clip(-c / a, 0.0, 1.0))
+        else:
+            b     = np.dot(d1, d2)
+            denom = a * e - b * b
+            s     = float(np.clip((b * f - c * e) / denom, 0.0, 1.0)) if abs(denom) > EPS else 0.0
+            t     = float(b * s + f) / float(e)
+            if t < 0.0:
+                t = 0.0;  s = float(np.clip(-c / a, 0.0, 1.0))
+            elif t > 1.0:
+                t = 1.0;  s = float(np.clip((b - c) / a, 0.0, 1.0))
+
+    c1   = p1 + s * d1
+    c2   = p3 + t * d2
+    diff = c1 - c2
+    return float(np.sqrt(max(np.dot(diff, diff), 0.0))), c1, c2
+
+
 def steer(dx, dy, dz, ox, oy, oz, r=0):
     """Blend the branch direction (dx, dy, dz) toward the cone-wall inward normal
     when the branch is close to the wall. Steering activates beyond STEER_ONSET
@@ -132,19 +211,10 @@ def steer(dx, dy, dz, ox, oy, oz, r=0):
     nl  = np.sqrt(ndx*ndx + ndy*ndy + ndz*ndz)
     return ndx/nl, ndy/nl, ndz/nl
 
-def grow(ox, oy, oz, dx, dy, dz, r, depth, k, seg_len, rng, max_depth, out):
-    """Recursively grow a branching tree skeleton inside the cone. Each call extends
-    a single segment from origin (ox, oy, oz) in direction (dx, dy, dz) with tube
-    radius r. On reaching depth 0 the branch terminates; otherwise k child branches
-    are spawned at evenly-spaced azimuths with a random perturbation and TORSION
-    twist per depth level. Segments that would leave the cone are nudged inward or
-    discarded. Results are appended to the out list as dicts with keys start, end,
-    r, and level."""
-    if not cone_contains(ox, oy, oz, r):
-        return
-    dx, dy, dz = steer(dx, dy, dz, ox, oy, oz, r)
-    if dz < -1e-6:
-        seg_len = min(oz / ((-dz) * (depth + 1)), CONE_H)
+def _clip_to_cone(ox, oy, oz, dx, dy, dz, seg_len, r):
+    """Compute endpoint (ox,oy,oz)+(dx,dy,dz)*seg_len and nudge it back inside
+    the cone (up to 6 inward steps of 25 % seg_len each).  Returns (ex, ey, ez)
+    or None when the endpoint cannot be recovered."""
     ex = ox + dx * seg_len
     ey = oy + dy * seg_len
     ez = oz + dz * seg_len
@@ -156,8 +226,164 @@ def grow(ox, oy, oz, dx, dy, dz, r, depth, k, seg_len, rng, max_depth, out):
             ez += inward[2] * seg_len * 0.25
             if cone_contains(ex, ey, ez, r):
                 break
-        if not cone_contains(ex, ey, ez, r):
-            return
+        else:
+            return None
+    return ex, ey, ez
+
+
+def grow(ox, oy, oz, dx, dy, dz, r, depth, k, seg_len, rng, max_depth, out,
+         lane=None, n_lanes=None):
+    """Recursively grow a branching tree skeleton inside the cone. Each call extends
+    a single segment from origin (ox, oy, oz) in direction (dx, dy, dz) with tube
+    radius r. On reaching depth 0 the branch terminates; otherwise k child branches
+    are spawned at evenly-spaced azimuths with a random perturbation and TORSION
+    twist per depth level. Segments that would leave the cone are nudged inward or
+    discarded. Results are appended to the out list as dicts with keys start, end,
+    r, and level.
+
+    When NO_INTERSECT is True each proposed segment is checked against every
+    already-placed segment.  The direction is deflected laterally (forward component
+    preserved) away from any tube that is closer than REPEL_ONSET × (r_a + r_b).
+    Up to REPEL_RETRIES correction steps are attempted; if the segment still
+    hard-intersects after all retries it is silently discarded.
+
+    When INTERTWINED is True and lane is provided, an additional helical-lane
+    bias is blended into the direction so each root traces its own spiral from
+    apex to base; NO_INTERSECT still prevents overlap between lanes."""
+    if not cone_contains(ox, oy, oz, r):
+        return
+    dx, dy, dz = steer(dx, dy, dz, ox, oy, oz, r)
+    if INTERTWINED and lane is not None and n_lanes is not None:
+        helix_dir = helix_target_direction(ox, oy, oz, lane, n_lanes, seg_len)
+        hdx = dx + LANE_BIAS * helix_dir[0]
+        hdy = dy + LANE_BIAS * helix_dir[1]
+        hdz = dz + LANE_BIAS * helix_dir[2]
+        hl  = np.sqrt(hdx*hdx + hdy*hdy + hdz*hdz)
+        if hl > 1e-9:
+            dx, dy, dz = hdx/hl, hdy/hl, hdz/hl
+    if dz < -1e-6:
+        seg_len = min(oz / ((-dz) * (depth + 1)), CONE_H)
+
+    # Initial endpoint (may be nudged by cone clip)
+    clipped = _clip_to_cone(ox, oy, oz, dx, dy, dz, seg_len, r)
+    if clipped is None:
+        return
+    ex, ey, ez = clipped
+
+    # ── inter-haptera repulsion ───────────────────────────────────────────────
+    if NO_INTERSECT and out:
+        origin = np.array([ox, oy, oz])
+        ndx, ndy, ndz = (ex - ox) / seg_len, (ey - oy) / seg_len, (ez - oz) / seg_len
+        nl = np.sqrt(ndx*ndx + ndy*ndy + ndz*ndz)
+        if nl > 1e-9:
+            ndx, ndy, ndz = ndx/nl, ndy/nl, ndz/nl
+
+        accepted = False
+        for _retry in range(REPEL_RETRIES):
+            end_pt = np.array([ox + ndx * seg_len,
+                               oy + ndy * seg_len,
+                               oz + ndz * seg_len])
+            repel        = np.zeros(3)
+            hard_overlap = False
+
+            for seg in out:
+                # Skip segments that share this junction — the touching endpoint
+                # always gives distance 0 and would trigger spurious repulsion.
+                if (np.linalg.norm(seg['end']   - origin) < 1e-3 or
+                        np.linalg.norm(seg['start'] - origin) < 1e-3):
+                    continue
+
+                min_clear = r + seg['r']
+                dist, c_new, c_exist = _seg_seg_closest(
+                    origin, end_pt, seg['start'], seg['end'])
+
+                if dist >= min_clear * REPEL_ONSET:
+                    continue  # comfortably clear
+
+                if dist < min_clear:
+                    hard_overlap = True
+
+                # Quadratic weight — stronger as gap shrinks toward zero
+                prox_t = 1.0 - dist / (min_clear * REPEL_ONSET)
+                weight = REPEL_STRENGTH * prox_t * prox_t
+
+                # Repulsion direction: away from the nearest point on the
+                # existing segment.  Project out the forward component so the
+                # branch steers sideways rather than reversing.
+                repel_dir = c_new - c_exist
+                rd_len    = np.linalg.norm(repel_dir)
+                if rd_len < 1e-6:
+                    # Perfectly coincident closest points — pick a lateral perp
+                    fwd  = np.array([ndx, ndy, ndz])
+                    perp = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
+                    pl   = np.linalg.norm(perp)
+                    if pl < 1e-6:
+                        perp = np.cross(fwd, np.array([1.0, 0.0, 0.0]))
+                        pl   = np.linalg.norm(perp)
+                    repel_dir = perp / max(pl, 1e-9)
+                else:
+                    repel_dir /= rd_len
+
+                # Remove the forward component → purely lateral deflection
+                fwd       = np.array([ndx, ndy, ndz])
+                repel_dir -= np.dot(repel_dir, fwd) * fwd
+                rl2        = np.linalg.norm(repel_dir)
+                if rl2 > 1e-9:
+                    repel_dir /= rl2
+
+                repel += repel_dir * weight
+
+            if not hard_overlap:
+                # No tube centres closer than their combined radii — accept
+                ex, ey, ez = end_pt
+                accepted = True
+                break
+
+            # Apply accumulated lateral push, re-normalise, re-steer, re-clip
+            ndx += repel[0];  ndy += repel[1];  ndz += repel[2]
+            nl   = np.sqrt(ndx*ndx + ndy*ndy + ndz*ndz)
+            if nl < 1e-9:
+                ndx, ndy, ndz = dx, dy, dz   # safety reset to original direction
+            else:
+                ndx, ndy, ndz = ndx/nl, ndy/nl, ndz/nl
+
+            ndx, ndy, ndz = steer(ndx, ndy, ndz, ox, oy, oz, r)
+
+            clipped = _clip_to_cone(ox, oy, oz, ndx, ndy, ndz, seg_len, r)
+            if clipped is None:
+                break    # repulsion pushed into wall — fall through to binary search
+            ex, ey, ez = clipped
+
+        if not accepted:
+            # Direction retries exhausted.  Binary-search for the longest
+            # sub-segment in the current direction that clears all tubes.
+            # This guarantees a segment is placed rather than dropped.
+            best_end = None
+            lo_t, hi_t = 0.0, 1.0
+            for _ in range(14):   # 2^-14 ≈ 0.006 % of seg_len resolution
+                mid_t    = (lo_t + hi_t) / 2.0
+                test_end = origin + np.array([ndx, ndy, ndz]) * (seg_len * mid_t)
+                if not cone_contains(test_end[0], test_end[1], test_end[2], r):
+                    hi_t = mid_t
+                    continue
+                overlap = False
+                for seg in out:
+                    if (np.linalg.norm(seg['end']   - origin) < 1e-3 or
+                            np.linalg.norm(seg['start'] - origin) < 1e-3):
+                        continue
+                    dist, _, _ = _seg_seg_closest(origin, test_end, seg['start'], seg['end'])
+                    if dist < r + seg['r']:
+                        overlap = True
+                        break
+                if overlap:
+                    hi_t = mid_t
+                else:
+                    best_end = test_end.copy()
+                    lo_t     = mid_t
+            if best_end is None:
+                return   # truly no room — discard only as last resort
+            ex, ey, ez = best_end[0], best_end[1], best_end[2]
+
     actual_len = np.sqrt((ex-ox)**2 + (ey-oy)**2 + (ez-oz)**2)
     if actual_len < 0.02:
         return
@@ -178,8 +404,16 @@ def grow(ox, oy, oz, dx, dy, dz, r, depth, k, seg_len, rng, max_depth, out):
         ndy = dy + np.sin(angle) * spread
         ndz = dz + rng() * 0.3 - 0.1
         nl  = np.sqrt(ndx*ndx + ndy*ndy + ndz*ndz)
+        if INTERTWINED and lane is not None and n_lanes is not None:
+            # Sibling children target neighbouring helical waypoints instead of
+            # the parent's exact lane, so fan-outs don't all chase the same helix.
+            sub_offset = (i / max(k - 1, 1) - 0.5) / n_lanes
+            child_lane = lane + sub_offset
+        else:
+            child_lane = None
         grow(ex, ey, ez, ndx/nl, ndy/nl, ndz/nl,
-             r, depth-1, k, seg_len, rng, max_depth, out)
+             r, depth-1, k, seg_len, rng, max_depth, out,
+             lane=child_lane, n_lanes=n_lanes)
 
 # ── volume helpers ────────────────────────────────────────────────────────────
 def naive_volume(segs):
@@ -393,19 +627,31 @@ def build_segments(depth, k):
     and branching factor k. N_ROOTS evenly-spaced root branches are started from
     near the cone apex, each grown recursively with grow(). After tree generation
     the radii are rescaled so the naive volume approximation matches BASE_VOLUME,
-    providing a good starting point for the iterative volume convergence loop."""
+    providing a good starting point for the iterative volume convergence loop.
+
+    When INTERTWINED is True each root's initial direction points at its first
+    helical waypoint and the lane is passed through grow() so children inherit
+    the helical bias; NO_INTERSECT still enforces non-overlap between lanes."""
     root_r = np.sqrt(BASE_VOLUME / (N_ROOTS * np.pi * SEG_LEN * (depth + 1)))
     rng    = make_rng(54321)
     segs   = []
     for i in range(N_ROOTS):
-        a  = (2 * np.pi * i / N_ROOTS) + 0.35
         ox, oy, oz = 0.0, 0.0, CONE_H - 0.05
-        rdx = np.cos(a) * 0.45
-        rdy = np.sin(a) * 0.45
-        rdz = -1.0
-        rl  = np.sqrt(rdx*rdx + rdy*rdy + rdz*rdz)
-        grow(ox, oy, oz, rdx/rl, rdy/rl, rdz/rl,
-             root_r, depth, k, SEG_LEN, rng, depth, segs)
+        if INTERTWINED:
+            init_dir = helix_target_direction(ox, oy, oz, i, N_ROOTS, SEG_LEN)
+            rdx, rdy, rdz = init_dir[0], init_dir[1], init_dir[2]
+            lane_arg, n_lanes_arg = i, N_ROOTS
+        else:
+            a  = (2 * np.pi * i / N_ROOTS) + 0.35
+            rdx = np.cos(a) * 0.45
+            rdy = np.sin(a) * 0.45
+            rdz = -1.0
+            rl  = np.sqrt(rdx*rdx + rdy*rdy + rdz*rdz)
+            rdx, rdy, rdz = rdx/rl, rdy/rl, rdz/rl
+            lane_arg, n_lanes_arg = None, None
+        grow(ox, oy, oz, rdx, rdy, rdz,
+             root_r, depth, k, SEG_LEN, rng, depth, segs,
+             lane=lane_arg, n_lanes=n_lanes_arg)
     nv = naive_volume(segs)
     cv = nv - overlap_volume(segs)
     # cv is almost always ≤ 0 for this geometry (r > seg_len means junction
@@ -524,6 +770,10 @@ for iteration in range(1, MAX_ITERS + 1):
     for _hhole in _horiz_hole_manifolds:
         m_final = m_final - _hhole  # drill the bore through haptera and boss
     combined_iter = _manifold_to_trimesh(m_final, _dlog)
+    # ── watertight repair: collapse duplicate vertices and plug any holes ─────
+    combined_iter.merge_vertices()
+    if not combined_iter.is_watertight:
+        trimesh.repair.fill_holes(combined_iter)
     # ── simplify before convergence check ─────────────────────────────────────
     if SIMPLIFY_TARGET > 0 and len(combined_iter.faces) > SIMPLIFY_TARGET:
         _n_before = len(combined_iter.faces)
@@ -532,6 +782,7 @@ for iteration in range(1, MAX_ITERS + 1):
         try:
             _tr = max(0.0, min(1.0 - 1e-9, 1.0 - SIMPLIFY_TARGET / _n_before))
             combined_iter = combined_iter.simplify_quadric_decimation(_tr)
+            combined_iter.merge_vertices()
             if not combined_iter.is_watertight:
                 trimesh.repair.fill_holes(combined_iter)
             _log(f"    [simplify] done  {_time.perf_counter()-_ts:.2f}s  "
@@ -605,6 +856,12 @@ for iteration in range(1, MAX_ITERS + 1):
         final_vol = final_vol_iter
 if _ibar: _ibar.close()
 
+
+# Final watertight pass so the exported STL is sealed regardless of how the
+# last iteration terminated (converged, max-iters, or infeasible-target break).
+combined.merge_vertices()
+if not combined.is_watertight:
+    trimesh.repair.fill_holes(combined)
 
 if DEBUG: print(f"[export] writing {OUTPUT}...")
 _t = _time.perf_counter()

@@ -44,8 +44,8 @@ SIMPLIFY_TARGET = 6000000
 
 # ── intertwining parameters ───────────────────────────────────────────────────
 # Fewer roots than the original so individual helical strands are visually distinct.
-N_ROOTS          = 10     # number of helical strands
-HELIX_TURNS      = 0.25  # full rotations around the cone axis from apex to base
+N_ROOTS          = 40     # number of helical strands
+HELIX_TURNS      = 0.5  # full rotations around the cone axis from apex to base
 RADIAL_FRACTION  = 0.65  # helix radius as a fraction of the available cone radius at each z
 
 # How strongly each branch is steered toward its helical lane waypoint.
@@ -504,6 +504,10 @@ for iteration in range(1, MAX_ITERS + 1):
     for _hhole in _horiz_hole_manifolds:
         m_final = m_final - _hhole
     combined_iter = _manifold_to_trimesh(m_final, _dlog)
+    # Watertight repair: collapse duplicate vertices and plug any holes
+    combined_iter.merge_vertices()
+    if not combined_iter.is_watertight:
+        trimesh.repair.fill_holes(combined_iter)
     if SIMPLIFY_TARGET > 0 and len(combined_iter.faces) > SIMPLIFY_TARGET:
         _n_before = len(combined_iter.faces)
         _log(f"    [simplify] {_n_before} → ≤{SIMPLIFY_TARGET} faces...")
@@ -511,6 +515,7 @@ for iteration in range(1, MAX_ITERS + 1):
         try:
             _tr = max(0.0, min(1.0 - 1e-9, 1.0 - SIMPLIFY_TARGET / _n_before))
             combined_iter = combined_iter.simplify_quadric_decimation(_tr)
+            combined_iter.merge_vertices()
             if not combined_iter.is_watertight:
                 trimesh.repair.fill_holes(combined_iter)
             _log(f"    [simplify] done  {_time.perf_counter()-_ts:.2f}s  "
@@ -578,6 +583,12 @@ for iteration in range(1, MAX_ITERS + 1):
         final_vol = final_vol_iter
 if _ibar: _ibar.close()
 
+
+# Final watertight pass so the exported STL is sealed regardless of how the
+# last iteration terminated (converged, max-iters, or infeasible-target break).
+combined.merge_vertices()
+if not combined.is_watertight:
+    trimesh.repair.fill_holes(combined)
 
 if DEBUG: print(f"[export] writing {OUTPUT}...")
 _t = _time.perf_counter()
