@@ -53,9 +53,9 @@ HORIZ_H      = 30  # height above the haptera base for horizontal cylinder cente
 # Set POCKET_X = 0 to disable the mold entirely.
 POCKET_X         = 103.5  # cube length along X (mm); 0 = disable
 POCKET_Y         =  89.0  # cube width  along Y (mm)
-POCKET_Z         =  25.5  # cube height along Z (mm)
-POCKET_CLEARANCE =   0.25 # gap between cube and cavity wall on the four side faces (mm)
-POCKET_WALL      =   5.0  # mold wall thickness — floor and four sides (mm)
+POCKET_Z         =  40.0  # cube height along Z (mm)
+POCKET_CLEARANCE =   1.0 # gap between cube and cavity wall on the four side faces (mm)
+POCKET_WALL      =   0  # mold wall thickness — floor and four sides (mm)
 POCKET_Z_BASE    =   0.0  # z-coordinate of the bottom face of the mold's outer floor
 
 SIMPLIFY_TARGET = 6000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
@@ -608,12 +608,15 @@ def _manifold_to_trimesh(manifold, _log):
 
     process=False and validate=False skip all mesh cleanup and validation — safe
     because manifold3d guarantees a watertight, non-self-intersecting mesh.
-    Arrays are passed directly (no extra copies).
+    Uses to_mesh64() for float64 precision: float32 quantization at radii near
+    CONE_R = 130 mm has 1 ULP ≈ 1.5e-5 mm, which is large enough to leave
+    nominally-coincident vertices at distinct positions, breaking watertightness
+    after the trimesh round-trip even when manifold3d's topology was correct.
     """
     import time
     _log("    [extract_mesh] converting Manifold to trimesh...")
     t0 = time.perf_counter()
-    r  = manifold.to_mesh()
+    r  = manifold.to_mesh64()
     result = trimesh.Trimesh(
         vertices=r.vert_properties[:, :3],  # slice XYZ; newer manifold3d appends extra property channels
         faces=r.tri_verts,
@@ -713,6 +716,408 @@ def _trimesh_to_mfd(m):
         tri_verts=m.faces.astype(np.uint32),
     ))
 
+def _drop_sliver_bodies(mesh, vol_threshold=1e-3):
+    """Remove disconnected components whose absolute volume is below the
+    threshold (mm³).  manifold3d boolean ops occasionally leave 1–few-triangle
+    fragments at the join between operands; they show up as separate bodies
+    in `mesh.body_count` and contribute non-manifold edges relative to the
+    main solid.  Volumes are computed per-component with the divergence
+    theorem so we don't pay for `mesh.split` (which would copy the geometry).
+    The largest body is always kept, even if it is below threshold, so we
+    never accidentally delete everything."""
+    if len(mesh.faces) == 0:
+        return 0
+    labels = trimesh.graph.connected_component_labels(
+        mesh.face_adjacency, node_count=len(mesh.faces))
+    unique = np.unique(labels)
+    if len(unique) <= 1:
+        return 0
+    # Per-face signed volume contribution: (v0 · (v1 × v2)) / 6.
+    tri        = mesh.triangles
+    face_vols  = np.einsum('ij,ij->i', tri[:, 0], np.cross(tri[:, 1], tri[:, 2])) / 6.0
+    body_vols  = {int(l): abs(float(face_vols[labels == l].sum())) for l in unique}
+    keep       = [l for l, v in body_vols.items() if v >= vol_threshold]
+    if not keep:
+        keep = [max(body_vols, key=body_vols.get)]
+    if len(keep) == len(unique):
+        return 0
+    dropped = len(unique) - len(keep)
+    keep_mask = np.isin(labels, np.array(keep))
+    mesh.update_faces(keep_mask)
+    mesh.remove_unreferenced_vertices()
+    return dropped
+
+def _delete_nonmanifold_faces(mesh, max_fraction=0.1):
+    """Delete only faces touching a strictly-non-manifold edge (≥3 faces share).
+    Boundary edges (1 face) are left alone — `fill_holes` patches those, while
+    deleting their faces just opens larger boundaries that `fill_holes` then
+    fails to bridge (the destructive runaway we hit before).
+
+    Returns the number of faces deleted, or -1 if the deletion would exceed
+    `max_fraction` of the mesh and was refused for safety."""
+    if len(mesh.faces) == 0:
+        return 0
+    edges     = mesh.edges_sorted                                                  # shape (3F, 2)
+    edge_keys = (edges[:, 0].astype(np.int64) << 32) | edges[:, 1].astype(np.int64)
+    _, inverse, counts = np.unique(edge_keys, return_inverse=True, return_counts=True)
+    edge_is_nm   = counts[inverse] >= 3                                            # shape (3F,)
+    face_has_nm  = edge_is_nm.reshape(-1, 3).any(axis=1)                           # shape (F,)
+    n_to_delete  = int(face_has_nm.sum())
+    if n_to_delete == 0:
+        return 0
+    if n_to_delete > max_fraction * len(mesh.faces):
+        return -1
+    mesh.update_faces(~face_has_nm)
+    mesh.remove_unreferenced_vertices()
+    return n_to_delete
+
+def _fill_loop_holes(mesh):
+    """Close arbitrary boundary loops by ear-clipping triangulation.
+
+    `trimesh.repair.fill_holes` only handles 3- and 4-edge holes; CSG output
+    from boolean ops can leave longer boundary loops where two surfaces graze
+    without quite intersecting cleanly.  This walks the directed boundary
+    edges (each appears in exactly one face, giving a consistent traversal
+    direction), groups them into closed loops, and seals each loop with ear
+    clipping that only commits a triangle when its chord-edge isn't already
+    in the mesh — preventing the "stack on existing triangle → 3-faced edge"
+    failure that plagued naive fan triangulation.  Loops with no manifold-
+    safe ear at any rotation fall back to a unique-offset centroid vertex.
+
+    The walker tracks *used boundary edges* rather than visited vertices, so
+    loops that pinch through a shared vertex are still recovered (a global
+    visited-vertex set would falsely terminate the second loop's walk as soon
+    as it hit the shared vertex).
+
+    Returns the number of triangles added."""
+    if mesh.is_watertight or len(mesh.faces) == 0:
+        return 0
+    edges        = np.asarray(mesh.edges)         # (3F, 2) directed
+    edges_sorted = mesh.edges_sorted              # (3F, 2)
+    if len(edges) == 0:
+        return 0
+    edge_keys = (edges_sorted[:, 0].astype(np.int64) << 32) | edges_sorted[:, 1].astype(np.int64)
+    _, inverse, counts = np.unique(edge_keys, return_inverse=True, return_counts=True)
+    boundary_mask = counts[inverse] == 1
+    if not boundary_mask.any():
+        return 0
+    boundary_edges = edges[boundary_mask]         # directed boundary edges only
+    n_edges        = len(boundary_edges)
+
+    # Map source vertex → list of (dest_vertex, boundary_edge_idx).
+    next_map = {}
+    for idx in range(n_edges):
+        v0, v1 = int(boundary_edges[idx, 0]), int(boundary_edges[idx, 1])
+        next_map.setdefault(v0, []).append((v1, idx))
+
+    used     = np.zeros(n_edges, dtype=bool)
+    loops    = []
+    max_walk = n_edges + 4
+    for start_idx in range(n_edges):
+        if used[start_idx]:
+            continue
+        start_v = int(boundary_edges[start_idx, 0])
+        used[start_idx] = True
+        loop    = [start_v, int(boundary_edges[start_idx, 1])]
+        current = loop[-1]
+        success = False
+        for _ in range(max_walk):
+            if current == start_v:
+                loop.pop()        # drop the duplicate closing vertex
+                success = True
+                break
+            chosen = -1
+            for ni, (_nxt_v, nxt_idx) in enumerate(next_map.get(current, ())):
+                if not used[nxt_idx]:
+                    chosen = ni
+                    break
+            if chosen < 0:
+                break
+            nxt_v, nxt_idx = next_map[current][chosen]
+            used[nxt_idx]  = True
+            current        = nxt_v
+            loop.append(current)
+        if success and len(loop) >= 3:
+            loops.append(loop)
+
+    if not loops:
+        return 0
+
+    # Ear-clipping triangulation.  Each clipped ear uses 3 consecutive loop
+    # vertices (v_prev, v_cur, v_next); the new face's chord-edge is
+    # (v_prev, v_next).  If that chord already exists in the mesh the chord
+    # would become 3-faced (existing triangle + new triangle, since the
+    # boundary edges v_prev→v_cur and v_cur→v_next get cancelled by the new
+    # face's reverse edges).  So we only clip ears whose chord is NOT in the
+    # existing edge set.  Ear clipping has *much* better local options than
+    # a single fixed-apex fan: we evaluate every candidate ear at every
+    # iteration, so as long as *some* manifold-safe ear exists we'll find
+    # it.  Falls back to a unique-offset centroid vertex if a loop has no
+    # safe ear at any rotation (rare but possible for fully-interlocked
+    # CSG residue).
+    existing_edges = set()
+    for v0, v1 in edges_sorted:
+        existing_edges.add((int(v0), int(v1)))
+
+    def _is_safe_ear(loop, i):
+        n = len(loop)
+        v_prev = loop[(i - 1) % n]
+        v_next = loop[(i + 1) % n]
+        if v_prev == v_next:
+            return False
+        key = (v_prev, v_next) if v_prev < v_next else (v_next, v_prev)
+        return key not in existing_edges
+
+    # Pre-allocate new-faces buffer for the worst case: a loop of size n
+    # contributes n-2 triangles via ear clipping, or n via centroid fallback.
+    n_tris_max = sum(max(len(l), 0) for l in loops)
+    if n_tris_max == 0:
+        return 0
+    new_faces  = np.empty((n_tris_max, 3), dtype=mesh.faces.dtype)
+    new_verts  = []   # any centroid-fallback vertices we add
+    fi         = 0
+    n_verts0   = len(mesh.vertices)
+    verts      = mesh.vertices
+    for li, loop in enumerate(loops):
+        if len(loop) < 3:
+            continue
+        # Ear-clip in place.  Each iteration picks the first safe ear and
+        # shrinks the loop by one vertex; bail to centroid fallback if no
+        # safe ear is found at any rotation.
+        work = list(loop)
+        clipped_ok = True
+        ear_faces = []
+        while len(work) > 3:
+            chosen = -1
+            for i in range(len(work)):
+                if _is_safe_ear(work, i):
+                    chosen = i
+                    break
+            if chosen < 0:
+                clipped_ok = False
+                break
+            n_w    = len(work)
+            v_prev = work[(chosen - 1) % n_w]
+            v_cur  = work[chosen]
+            v_next = work[(chosen + 1) % n_w]
+            ear_faces.append((v_prev, v_cur, v_next))
+            key = (v_prev, v_next) if v_prev < v_next else (v_next, v_prev)
+            existing_edges.add(key)
+            work.pop(chosen)
+        if clipped_ok and len(work) == 3:
+            v_prev, v_cur, v_next = work
+            ear_faces.append((v_prev, v_cur, v_next))
+            for a, b in ((v_prev, v_next), (v_prev, v_cur), (v_cur, v_next)):
+                key = (a, b) if a < b else (b, a)
+                existing_edges.add(key)
+        if clipped_ok:
+            # Boundary edges in the loop walked V_i→V_{i+1}; ear clipping
+            # produces triangles (v_prev, v_cur, v_next) whose edges include
+            # v_cur→v_prev (reverse of v_prev→v_cur) — the manifold-sealing
+            # direction.  fix_winding repairs anything we got backwards.
+            for face in ear_faces:
+                new_faces[fi] = face
+                fi += 1
+        else:
+            # Centroid fallback: insert a new vertex unique to this loop.
+            # Offset by loop index × 1e-3 mm in Z to guarantee no two
+            # centroids round to the same digits_vertex=5 grid cell after
+            # merge_vertices.
+            loop_pts = verts[loop]
+            centroid = loop_pts.mean(axis=0).copy()
+            centroid[2] += (li + 1) * 1e-3
+            new_idx  = n_verts0 + len(new_verts)
+            new_verts.append(centroid)
+            n_loop = len(loop)
+            for i in range(n_loop):
+                v_a = loop[i]
+                v_b = loop[(i + 1) % n_loop]
+                new_faces[fi] = (new_idx, v_b, v_a)
+                fi += 1
+                key = (new_idx, v_a) if new_idx < v_a else (v_a, new_idx)
+                existing_edges.add(key)
+                key = (new_idx, v_b) if new_idx < v_b else (v_b, new_idx)
+                existing_edges.add(key)
+
+    if fi == 0:
+        return 0
+    if new_verts:
+        mesh.vertices = np.vstack([verts, np.asarray(new_verts, dtype=verts.dtype)])
+    mesh.faces = np.vstack([mesh.faces, new_faces[:fi]])
+    return fi
+
+def _drop_open_bodies(mesh):
+    """Drop *small* open-boundary components, keeping the largest body and any
+    watertight components.
+
+    The main haptera body is the largest connected component; if its remaining
+    boundary edges weren't sealed by `_fill_loop_holes` we still want to keep
+    it (so a downstream repair pass can try again) — dropping it would leave
+    only tiny CSG-residue shells.  The complementary case is also handled:
+    smaller open bodies (slivers from boolean grazing) are dropped, while
+    smaller watertight bodies (legitimate disconnected solids) are preserved.
+    """
+    if len(mesh.faces) == 0:
+        return 0
+    labels = trimesh.graph.connected_component_labels(
+        mesh.face_adjacency, node_count=len(mesh.faces))
+    unique = np.unique(labels)
+    if len(unique) <= 1:
+        return 0
+
+    # Per-component boundary check: an edge is a boundary edge for the body
+    # iff exactly one face in that body uses it.  Combining the label into the
+    # edge key gives a per-(body, edge) histogram in one np.unique call.
+    edges_sorted   = mesh.edges_sorted                                # (3F, 2)
+    edge_keys      = (edges_sorted[:, 0].astype(np.int64) << 32) | edges_sorted[:, 1].astype(np.int64)
+    face_labels    = labels                                           # (F,)
+    edge_labels    = np.repeat(face_labels, 3)                        # (3F,)
+    composite      = (edge_labels.astype(np.int64) << 60) | (edge_keys & ((1 << 60) - 1))
+    _, inv, cnts   = np.unique(composite, return_inverse=True, return_counts=True)
+    edge_is_open   = cnts[inv] == 1                                   # (3F,)
+    face_has_open  = edge_is_open.reshape(-1, 3).any(axis=1)          # (F,)
+
+    body_face_count = {}
+    body_open       = {}
+    for label in unique:
+        mask                    = face_labels == label
+        body_face_count[label]  = int(mask.sum())
+        body_open[label]        = bool(face_has_open[mask].any())
+
+    largest = max(body_face_count, key=body_face_count.get)
+    keep    = {largest}
+    # Preserve all watertight components — they're complete by definition and
+    # might be legitimate disconnected solids (e.g. an isolated tube).
+    for l in unique:
+        if not body_open[l]:
+            keep.add(l)
+    if len(keep) == len(unique):
+        return 0
+    keep_mask = np.isin(labels, np.array(list(keep)))
+    mesh.update_faces(keep_mask)
+    mesh.remove_unreferenced_vertices()
+    return len(unique) - len(keep)
+
+def _make_watertight(mesh, aggressive=False):
+    """Robust repair pipeline so the exported STL is a valid solid.
+    CSG output from manifold3d (float32) can leave coincident vertices,
+    duplicate/degenerate faces, inconsistent winding, sliver bodies, and
+    small boundary loops; the standalone merge+fill_holes pattern misses
+    most of these.  Each step here is conservative — only deletes faces
+    touching strictly-non-manifold edges or fills genuine boundary loops.
+
+    digits_vertex=5 rounds positions to 1e-5 mm before merging — coarse
+    enough to absorb float32 round-off from manifold3d (~1e-7) but tight
+    enough to leave legitimately-distinct vertices alone (going to
+    digits_vertex=4 was too aggressive and *created* non-manifold geometry
+    by collapsing vertices that should have stayed apart).
+
+    `aggressive=True` additionally drops sliver bodies and surgically
+    deletes faces touching non-manifold edges, then re-fills.  Boundary-
+    edge faces are NEVER blanket-deleted — that path was destructive."""
+    mesh.merge_vertices(digits_vertex=5)
+    mesh.update_faces(mesh.unique_faces())
+    mesh.update_faces(mesh.nondegenerate_faces())
+    mesh.remove_unreferenced_vertices()
+    if not mesh.is_winding_consistent:
+        trimesh.repair.fix_winding(mesh)
+    if not mesh.is_watertight:
+        trimesh.repair.fill_holes(mesh)
+        mesh.merge_vertices(digits_vertex=5)
+        if not mesh.is_winding_consistent:
+            trimesh.repair.fix_winding(mesh)
+    if aggressive:
+        _drop_sliver_bodies(mesh, vol_threshold=1e-3)
+        # Surgical T-junction repair: only target non-manifold edges. Capped
+        # at 3 passes (≥3 is rare in practice; a stuck loop usually means the
+        # geometry has interlocking shells that no triangle-level fix resolves).
+        for _ in range(3):
+            n = _delete_nonmanifold_faces(mesh, max_fraction=0.1)
+            if n <= 0:
+                break
+            trimesh.repair.fill_holes(mesh)
+            mesh.merge_vertices(digits_vertex=5)
+            if not mesh.is_winding_consistent:
+                trimesh.repair.fix_winding(mesh)
+        # Custom hole-filler for boundary loops with >4 edges that
+        # trimesh.repair.fill_holes can't bridge. Each outer pass interleaves
+        # fan-fill with non-manifold cleanup (fan can introduce non-manifold
+        # edges when loop[0] is already chord-connected to a mid-loop vertex,
+        # so we delete those faces and re-fill the resulting holes — which
+        # may be >4 edges, so both fill_holes AND _fill_loop_holes are run).
+        # Loop runs until watertight OR no further progress is being made.
+        prev_state = (-1, -1)
+        for _ in range(8):
+            if mesh.is_watertight:
+                break
+            _fill_loop_holes(mesh)
+            # If ear-clipping reached watertight, do *not* run merge_vertices /
+            # unique_faces / nondegenerate_faces — those can collapse vertices
+            # to within `digits_vertex=5` tolerance and reopen edges that were
+            # just sealed.  Only fix winding if it's inconsistent.
+            if mesh.is_watertight:
+                if not mesh.is_winding_consistent:
+                    trimesh.repair.fix_winding(mesh)
+                break
+            mesh.update_faces(mesh.unique_faces())
+            mesh.update_faces(mesh.nondegenerate_faces())
+            mesh.merge_vertices(digits_vertex=5)
+            mesh.remove_unreferenced_vertices()
+            if not mesh.is_winding_consistent:
+                trimesh.repair.fix_winding(mesh)
+            # Surgical non-manifold cleanup: delete faces touching 3+-faced
+            # edges, then re-fill BOTH small (fill_holes) and large
+            # (_fill_loop_holes) holes the deletion creates.
+            for _ in range(3):
+                n_nm = _delete_nonmanifold_faces(mesh, max_fraction=0.05)
+                if n_nm <= 0:
+                    break
+                trimesh.repair.fill_holes(mesh)
+                _fill_loop_holes(mesh)
+                mesh.update_faces(mesh.unique_faces())
+                mesh.update_faces(mesh.nondegenerate_faces())
+                mesh.merge_vertices(digits_vertex=5)
+                mesh.remove_unreferenced_vertices()
+                if not mesh.is_winding_consistent:
+                    trimesh.repair.fix_winding(mesh)
+            # Detect convergence: if the (boundary, non-manifold) edge counts
+            # haven't changed from the previous outer pass we're in a fixed
+            # point and further iteration won't help.  Use np.unique rather
+            # than bincount — edge keys span the full int64 range (vertex IDs
+            # up to ~50k packed two-into-one) and bincount would allocate an
+            # array sized to max(key).
+            if len(mesh.faces):
+                es = mesh.edges_sorted
+                ek = (es[:, 0].astype(np.int64) << 32) | es[:, 1].astype(np.int64)
+                _, cnts = np.unique(ek, return_counts=True)
+                n_bdry = int((cnts == 1).sum())
+                n_nm   = int((cnts >= 3).sum())
+            else:
+                n_bdry = n_nm = 0
+            cur_state = (n_bdry, n_nm)
+            if cur_state == prev_state:
+                break
+            prev_state = cur_state
+        # Drop any bodies still carrying boundary edges (CSG residue that no
+        # hole-fill can rescue), keeping the largest if every body is open.
+        if not mesh.is_watertight:
+            _drop_open_bodies(mesh)
+            if not mesh.is_watertight:
+                trimesh.repair.fill_holes(mesh)
+                _fill_loop_holes(mesh)
+                mesh.merge_vertices(digits_vertex=5)
+                mesh.remove_unreferenced_vertices()
+                if not mesh.is_winding_consistent:
+                    trimesh.repair.fix_winding(mesh)
+        # Re-drop volume-based slivers in case fill_holes capped a hole into
+        # its own component.
+        _drop_sliver_bodies(mesh, vol_threshold=1e-3)
+    # Final orientation fix: if the closed surface has inverted winding the
+    # signed volume comes out negative — flip it so trimesh sees a positive solid.
+    if mesh.is_watertight and mesh.volume < 0:
+        mesh.invert()
+    return mesh
+
 _vert_boss_manifold  = None
 _vert_hole_manifold  = None
 # Horizontal boss and hole manifolds stored separately so they can be applied
@@ -771,16 +1176,19 @@ _pocket_outer_volume    = 0.0
 _pocket_cube_volume     = 0.0
 _pocket_wall_volume     = 0.0
 if POCKET_X > 0:
-    _pocket_out_x = POCKET_X + 2.0 * POCKET_WALL
-    _pocket_out_y = POCKET_Y + 2.0 * POCKET_WALL
-    _pocket_out_z = POCKET_Z + POCKET_WALL                # bottom slab + cavity-height walls
+    # Outer block grows with both clearance and wall thickness so the side
+    # walls retain POCKET_WALL of material no matter how large the clearance.
+    _pocket_out_x = POCKET_X + 2.0 * POCKET_CLEARANCE + 2.0 * POCKET_WALL
+    _pocket_out_y = POCKET_Y + 2.0 * POCKET_CLEARANCE + 2.0 * POCKET_WALL
+    _pocket_out_z = POCKET_Z + POCKET_WALL                # cavity-height walls + top slab
     _pocket_outer_box = trimesh.creation.box(extents=[_pocket_out_x, _pocket_out_y, _pocket_out_z])
     _pocket_outer_box.apply_translation([0.0, 0.0, POCKET_Z_BASE + _pocket_out_z / 2.0])
     _pocket_outer_manifold = _trimesh_to_mfd(_pocket_outer_box)
 
-    # Cavity extends past the top of the outer block so the boolean cleanly
-    # punches through to leave an open top.  The bottom of the cavity rests on
-    # the floor slab (z = POCKET_Z_BASE + POCKET_WALL); the cube sits on it.
+    # Cavity extends past the bottom of the outer block so the boolean cleanly
+    # punches through to leave an open bottom.  The top of the cavity meets the
+    # underside of the top slab (z = POCKET_Z_BASE + POCKET_Z); the cube hangs
+    # from it and slides out the open bottom for fit-checking.
     _pocket_overshoot = POCKET_WALL
     _pocket_cav_x = POCKET_X + 2.0 * POCKET_CLEARANCE
     _pocket_cav_y = POCKET_Y + 2.0 * POCKET_CLEARANCE
@@ -788,7 +1196,7 @@ if POCKET_X > 0:
     _pocket_cavity_box = trimesh.creation.box(extents=[_pocket_cav_x, _pocket_cav_y, _pocket_cav_z])
     _pocket_cavity_box.apply_translation([
         0.0, 0.0,
-        POCKET_Z_BASE + POCKET_WALL + _pocket_cav_z / 2.0,
+        POCKET_Z_BASE + POCKET_Z - _pocket_cav_z / 2.0,
     ])
     _pocket_cavity_manifold = _trimesh_to_mfd(_pocket_cavity_box)
 
@@ -829,8 +1237,6 @@ for iteration in range(1, MAX_ITERS + 1):
     if _vert_boss_manifold is not None:
         m_final = m_final - _vert_boss_manifold  # purge haptera inside boss
         m_final = m_final + _vert_boss_manifold  # add clean boss solid
-    if _vert_hole_manifold is not None:
-        m_final = m_final - _vert_hole_manifold
     for _hboss in _horiz_boss_manifolds:
         m_final = m_final - _hboss  # purge haptera inside boss region
         m_final = m_final + _hboss  # add clean boss solid
@@ -842,11 +1248,13 @@ for iteration in range(1, MAX_ITERS + 1):
         # block (= mold walls + cube) back in.
         m_final = m_final - _pocket_outer_manifold
         m_final = m_final + _pocket_outer_manifold
+    # Drill the central vertical hole LAST so it cuts through haptera, boss,
+    # and the pocket/dive-weight mold block in one pass.
+    if _vert_hole_manifold is not None:
+        m_final = m_final - _vert_hole_manifold
     combined_iter = _manifold_to_trimesh(m_final, _dlog)
     # ── watertight repair: collapse duplicate vertices and plug any holes ─────
-    combined_iter.merge_vertices()
-    if not combined_iter.is_watertight:
-        trimesh.repair.fill_holes(combined_iter)
+    _make_watertight(combined_iter)
     # ── simplify before convergence check ─────────────────────────────────────
     if SIMPLIFY_TARGET > 0 and len(combined_iter.faces) > SIMPLIFY_TARGET:
         _n_before = len(combined_iter.faces)
@@ -855,9 +1263,7 @@ for iteration in range(1, MAX_ITERS + 1):
         try:
             _tr = max(0.0, min(1.0 - 1e-9, 1.0 - SIMPLIFY_TARGET / _n_before))
             combined_iter = combined_iter.simplify_quadric_decimation(_tr)
-            combined_iter.merge_vertices()
-            if not combined_iter.is_watertight:
-                trimesh.repair.fill_holes(combined_iter)
+            _make_watertight(combined_iter)
             _log(f"    [simplify] done  {_time.perf_counter()-_ts:.2f}s  "
                  f"({_n_before} → {len(combined_iter.faces)} faces)")
         except Exception as _e:
@@ -877,6 +1283,7 @@ for iteration in range(1, MAX_ITERS + 1):
         if _ibar: _ibar.update(1)
         combined  = combined_iter
         final_vol = final_vol_iter
+        final_mfd = m_final  # keep the manifold3d version for cavity subtraction
         break
     # Correction steered on raw haptera volume (before boss/hole) since only tube radii are scaled.
     # m_final.volume() = V(haptera+boss) - hole_volume, so (m_final.volume()-measured_vol) already
@@ -890,6 +1297,7 @@ for iteration in range(1, MAX_ITERS + 1):
              f"Lower TARGET_INTERSTITIAL_FRACTION and re-run.")
         combined  = combined_iter
         final_vol = final_vol_iter
+        final_mfd = m_final
         break
     if interstitial_iter > _target_interstitial:
         lo_factor = cumulative_factor
@@ -927,28 +1335,29 @@ for iteration in range(1, MAX_ITERS + 1):
         _log("  ! max iterations reached")
         combined  = combined_iter
         final_vol = final_vol_iter
+        final_mfd = m_final
 if _ibar: _ibar.close()
 
 
 # Final watertight pass so the exported STLs are sealed regardless of how the
 # last iteration terminated (converged, max-iters, or infeasible-target break).
-combined.merge_vertices()
-if not combined.is_watertight:
-    trimesh.repair.fill_holes(combined)
+# Aggressive mode drops sliver bodies and surgically removes faces touching
+# non-manifold edges; iteration-loop calls stayed lightweight.
+_make_watertight(combined, aggressive=True)
 
 # `combined` is the FULL version (cavity treated as solid for volume targeting).
 # Build the EMPTY version (cavity hollow) for 3D printing by subtracting the
-# pre-built cavity manifold.  When the pocket is disabled both names alias the
-# same mesh and only one STL is exported.
+# pre-built cavity manifold *in manifold3d*, on the saved m_final.  This
+# avoids the trimesh→manifold→trimesh round-trip on `combined_full`, which
+# previously amplified non-manifold artifacts.  When the pocket is disabled
+# both names alias the same mesh and only one STL is exported.
 combined_full = combined
 if _pocket_cavity_manifold is not None:
-    if DEBUG: print(f"[pocket] subtracting cavity to build empty version...")
+    if DEBUG: print(f"[pocket] subtracting cavity in manifold3d to build empty version...")
     _t_pocket = _time.perf_counter()
-    _empty_mfd     = _trimesh_to_mfd(combined_full) - _pocket_cavity_manifold
+    _empty_mfd     = final_mfd - _pocket_cavity_manifold
     combined_empty = _manifold_to_trimesh(_empty_mfd, lambda _msg: None)
-    combined_empty.merge_vertices()
-    if not combined_empty.is_watertight:
-        trimesh.repair.fill_holes(combined_empty)
+    _make_watertight(combined_empty, aggressive=True)
     if DEBUG: print(f"[pocket] done  {_time.perf_counter()-_t_pocket:.2f}s  "
                     f"({len(combined_empty.vertices)} verts, {len(combined_empty.faces)} faces)")
 else:
@@ -1077,6 +1486,45 @@ print(f"  segments               : {len(segs)}")
 print(f"  vertices               : {len(combined.vertices)}")
 print(f"  faces                  : {len(combined.faces)}")
 print(f"")
+# ── solidity test ─────────────────────────────────────────────────────────────
+# A mesh is "solid" (a printable, valid volume) iff it is watertight, has
+# consistent face winding, has positive volume, and has only manifold edges
+# (each edge shared by exactly two faces).  trimesh.is_volume bundles these
+# checks; we report the individual flags too so a failure points to the cause.
+def _solidity_report(label, mesh):
+    # Boundary edges (shared by 1 face) → open holes. Non-manifold edges
+    # (shared by 3+ faces) → T-junctions / overlapping shells. Both block
+    # is_watertight; the counts pinpoint which one is the problem.
+    edges = mesh.edges_sorted
+    _, edge_counts = np.unique(edges, axis=0, return_counts=True)
+    boundary_edges    = int((edge_counts == 1).sum())
+    nonmanifold_edges = int((edge_counts >= 3).sum())
+    body_count        = int(mesh.body_count)
+    broken_face_count = len(trimesh.repair.broken_faces(mesh))
+    checks = {
+        "is_volume (solid)"  : bool(mesh.is_volume),
+        "watertight"         : bool(mesh.is_watertight),
+        "winding consistent" : bool(mesh.is_winding_consistent),
+        "positive volume"    : bool(mesh.volume > 0),
+        "manifold edges"     : nonmanifold_edges == 0,
+        "no open boundary"   : boundary_edges == 0,
+    }
+    print(f"{label}")
+    for name, ok in checks.items():
+        print(f"  {name:<22} : {'PASS' if ok else 'FAIL'}")
+    print(f"  {'boundary edges':<22} : {boundary_edges}  (>0 = open holes)")
+    print(f"  {'non-manifold edges':<22} : {nonmanifold_edges}  (>0 = T-junctions / overlaps)")
+    print(f"  {'broken faces':<22} : {broken_face_count}  (faces touching a bad edge)")
+    print(f"  {'connected bodies':<22} : {body_count}  (>1 = floating shells)")
+    print(f"  {'euler characteristic':<22} : {mesh.euler_number}  (closed genus-g surface = 2 - 2g)")
+    print(f"  {'volume':<22} : {mesh.volume:.4f}")
+    print(f"")
+
+if OUTPUT_FULL is not None:
+    _solidity_report("Solidity (full STL — analysis mesh)",  combined_full)
+    _solidity_report("Solidity (empty STL — printable mesh)", combined_empty)
+else:
+    _solidity_report("Solidity", combined_empty)
 print(f"Haptera")
 print(f"  volume                 : {final_vol:.4f}")
 _final_target_iv = TARGET_INTERSTITIAL_FRACTION * hull_volume - hole_volume
@@ -1095,16 +1543,16 @@ if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
     print(f"  surface area           : {horiz_tube_sa:.4f}  (boss outer + end caps + bore walls)")
     print(f"")
 if POCKET_X > 0:
-    print(f"Pocket / mold (centered on cone axis, top-open)")
+    print(f"Pocket / mold (centered on cone axis, bottom-open)")
     print(f"  cube dimensions        : {POCKET_X} × {POCKET_Y} × {POCKET_Z}  (target dive-weight footprint)")
     print(f"  cavity dimensions      : {POCKET_X + 2*POCKET_CLEARANCE:.2f} × {POCKET_Y + 2*POCKET_CLEARANCE:.2f} × {POCKET_Z + POCKET_CLEARANCE:.2f}  (cube + {POCKET_CLEARANCE} mm clearance)")
-    print(f"  outer dimensions       : {POCKET_X + 2*POCKET_WALL:.2f} × {POCKET_Y + 2*POCKET_WALL:.2f} × {POCKET_Z + POCKET_WALL:.2f}  (cavity + {POCKET_WALL} mm walls/floor)")
-    print(f"  z range                : [{POCKET_Z_BASE:.2f}, {POCKET_Z_BASE + POCKET_Z + POCKET_WALL:.2f}]  (POCKET_Z_BASE → top)")
+    print(f"  outer dimensions       : {POCKET_X + 2*POCKET_WALL:.2f} × {POCKET_Y + 2*POCKET_WALL:.2f} × {POCKET_Z + POCKET_WALL:.2f}  (cavity + {POCKET_WALL} mm walls/top slab)")
+    print(f"  z range                : [{POCKET_Z_BASE:.2f}, {POCKET_Z_BASE + POCKET_Z + POCKET_WALL:.2f}]  (POCKET_Z_BASE → top slab)")
     print(f"  outer block volume     : {_pocket_outer_volume:.4f}  (analytical, full cube of mold)")
     print(f"  cube/cavity volume     : {_pocket_cube_volume:.4f}  (analytical, treated as full for interstitial calc)")
-    print(f"  wall+floor volume      : {_pocket_wall_volume:.4f}  (analytical, outer − cube)")
+    print(f"  wall+top volume        : {_pocket_wall_volume:.4f}  (analytical, outer − cube)")
     print(f"  full STL (analysis)    : cavity solid; feed to pocket_analysis.py")
-    print(f"  empty STL (3D-print)   : cavity hollow; print this and drop the dive weight in")
+    print(f"  empty STL (3D-print)   : cavity hollow; print this and slide the dive weight up from below")
     print(f"")
 print(f"Cone (design reference)")
 print(f"  total volume           : {cone_volume:.4f}")

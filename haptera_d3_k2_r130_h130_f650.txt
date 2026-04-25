@@ -12,49 +12,72 @@ Parameters
   steer_strength         : 1.1
   cone_h                 : 130
   cone_r                 : 130
-  vert_boss_r            : 0
-  vert_hole_r            : 0
-  horiz_boss_r           : 6
-  horiz_hole_r           : 4
+  vert_boss_r            : 8
+  vert_hole_r            : 6
+  horiz_boss_r           : 0
+  horiz_hole_r           : 0
   horiz_n                : 2
   horiz_s                : 60
   horiz_h                : 30
   pocket_x               : 103.5
   pocket_y               : 89.0
-  pocket_z               : 25.5
-  pocket_clearance       : 0.25
-  pocket_wall            : 5.0
+  pocket_z               : 40.0
+  pocket_clearance       : 2.0
+  pocket_wall            : 1.0
   pocket_z_base          : 0.0
   target_interstitial_frac: 0.650387  (fraction of hull volume)
   base_volume (haptera)  : 804352.8790
 
 Mesh
   segments               : 591
-  vertices               : 59251
-  faces                  : 119288
+  vertices               : 51052
+  faces                  : 102732
+
+Solidity (full STL — analysis mesh)
+  is_volume (solid)      : PASS
+  watertight             : PASS
+  winding consistent     : PASS
+  positive volume        : PASS
+  manifold edges         : PASS
+  no open boundary       : PASS
+  boundary edges         : 0  (>0 = open holes)
+  non-manifold edges     : 0  (>0 = T-junctions / overlaps)
+  broken faces           : 0  (faces touching a bad edge)
+  connected bodies       : 4  (>1 = floating shells)
+  euler characteristic   : -314  (closed genus-g surface = 2 - 2g)
+  volume                 : 808800.1056
+
+Solidity (empty STL — printable mesh)
+  is_volume (solid)      : PASS
+  watertight             : PASS
+  winding consistent     : PASS
+  positive volume        : PASS
+  manifold edges         : PASS
+  no open boundary       : PASS
+  boundary edges         : 0  (>0 = open holes)
+  non-manifold edges     : 0  (>0 = T-junctions / overlaps)
+  broken faces           : 0  (faces touching a bad edge)
+  connected bodies       : 127  (>1 = floating shells)
+  euler characteristic   : -68  (closed genus-g surface = 2 - 2g)
+  volume                 : 406616.2777
 
 Haptera
-  volume                 : 833852.9270
-  interstitial vol error : 0.078%  (haptera-only vs fraction target)
-  surface area (w/ cap)  : 266528.5736  (exact (includes flat base cap))
-  wetted surface area    : 259698.8366  (base cap excluded; bore walls included)
-  base cap area          : 6829.7370
+  volume                 : 808800.1056
+  interstitial vol error : 0.069%  (haptera-only vs fraction target)
+  surface area (w/ cap)  : 246500.3397  (exact (includes flat base cap))
+  wetted surface area    : 239667.5233  (base cap excluded; bore walls included)
+  base cap area          : 6832.8164
 
-Horizontal cylinders (analytical, both cylinders)
-  boss solid vol added   : 23975.1071  (annular solid unioned into haptera)
-  bore displacement vol  : 19180.0857  (volume drilled out of haptera+boss)
-  surface area           : 24226.4345  (boss outer + end caps + bore walls)
-
-Pocket / mold (centered on cone axis, top-open)
-  cube dimensions        : 103.5 × 89.0 × 25.5  (target dive-weight footprint)
-  cavity dimensions      : 104.00 × 89.50 × 25.75  (cube + 0.25 mm clearance)
-  outer dimensions       : 113.50 × 99.00 × 30.50  (cavity + 5.0 mm walls/floor)
-  z range                : [0.00, 30.50]  (POCKET_Z_BASE → top)
-  outer block volume     : 342713.2500  (analytical, full cube of mold)
-  cube/cavity volume     : 234893.2500  (analytical, treated as full for interstitial calc)
-  wall+floor volume      : 107820.0000  (analytical, outer − cube)
+Pocket / mold (centered on cone axis, bottom-open)
+  cube dimensions        : 103.5 × 89.0 × 40.0  (target dive-weight footprint)
+  cavity dimensions      : 107.50 × 93.00 × 42.00  (cube + 2.0 mm clearance)
+  outer dimensions       : 105.50 × 91.00 × 41.00  (cavity + 1.0 mm walls/top slab)
+  z range                : [0.00, 41.00]  (POCKET_Z_BASE → top slab)
+  outer block volume     : 426502.5000  (analytical, full cube of mold)
+  cube/cavity volume     : 368460.0000  (analytical, treated as full for interstitial calc)
+  wall+top volume        : 58042.5000  (analytical, outer − cube)
   full STL (analysis)    : cavity solid; feed to pocket_analysis.py
-  empty STL (3D-print)   : cavity hollow; print this and drop the dive weight in
+  empty STL (3D-print)   : cavity hollow; print this and slide the dive weight up from below
 
 Cone (design reference)
   total volume           : 2300693.0200
@@ -62,15 +85,15 @@ Cone (design reference)
   base area              : 53092.9158  (excluded — open base)
 
 Convex hull (actual bounding envelope)
-  hull volume            : 2381597.0279
-  hull surface area      : 118458.8315
+  hull volume            : 2310481.7878
+  hull surface area      : 117361.8034
 
 Interstitial space
-  volume (total)         : 1547744.1010  (hull − haptera; includes all bore voids)
-  volume (haptera only)  : 1547744.1010  (vert bore excluded; matches calibration target)
-  horiz bore volume      : 19180.0857  (HORIZ_HOLE contribution, analytical)
-  bore wall area         : 9590.0428  (vert + horiz bore lateral walls, analytical)
-  external surface area  : 128048.8744  (hull surface + all bore walls)
-  internal surface area  : 266528.5736  (haptera mesh; all bore walls included)
-  total bounding area    : 344646.7597  (external + internal; ground-contact faces excluded)
-  SA / volume ratio      : 0.1678  (complexity index using total wetted SA)
+  volume (total)         : 1501681.6822  (hull − haptera; includes all bore voids)
+  volume (haptera only)  : 1486979.0286  (vert bore excluded; matches calibration target)
+  vert bore volume       : 14702.6536  (VERT_HOLE contribution)
+  bore wall area         : 4900.8845  (vert + horiz bore lateral walls, analytical)
+  external surface area  : 122262.6880  (hull surface + all bore walls)
+  internal surface area  : 246500.3397  (haptera mesh; all bore walls included)
+  total bounding area    : 318829.2600  (external + internal; ground-contact faces excluded)
+  SA / volume ratio      : 0.1596  (complexity index using total wetted SA)
