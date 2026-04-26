@@ -22,16 +22,16 @@ Parameters
   pocket_x               : 103.5
   pocket_y               : 89.0
   pocket_z               : 40.0
-  pocket_clearance       : 2.0
+  pocket_clearance       : 1.0
   pocket_wall            : 1.0
   pocket_z_base          : 0.0
-  target_interstitial_frac: 0.650387  (fraction of hull volume)
+  target_interstitial_frac: 0.650387  (fraction of hull − pocket)
   base_volume (haptera)  : 804352.8790
 
 Mesh
   segments               : 591
-  vertices               : 51052
-  faces                  : 102732
+  vertices               : 36633
+  faces                  : 73744
 
 Solidity (full STL — analysis mesh)
   is_volume (solid)      : PASS
@@ -43,9 +43,9 @@ Solidity (full STL — analysis mesh)
   boundary edges         : 0  (>0 = open holes)
   non-manifold edges     : 0  (>0 = T-junctions / overlaps)
   broken faces           : 0  (faces touching a bad edge)
-  connected bodies       : 4  (>1 = floating shells)
-  euler characteristic   : -314  (closed genus-g surface = 2 - 2g)
-  volume                 : 808800.1056
+  connected bodies       : 6  (>1 = floating shells)
+  euler characteristic   : -239  (closed genus-g surface = 2 - 2g)
+  volume                 : 1046785.1937
 
 Solidity (empty STL — printable mesh)
   is_volume (solid)      : PASS
@@ -57,25 +57,25 @@ Solidity (empty STL — printable mesh)
   boundary edges         : 0  (>0 = open holes)
   non-manifold edges     : 0  (>0 = T-junctions / overlaps)
   broken faces           : 0  (faces touching a bad edge)
-  connected bodies       : 127  (>1 = floating shells)
-  euler characteristic   : -68  (closed genus-g surface = 2 - 2g)
-  volume                 : 406616.2777
+  connected bodies       : 6  (>1 = floating shells)
+  euler characteristic   : -239  (closed genus-g surface = 2 - 2g)
+  volume                 : 667276.4206
 
 Haptera
-  volume                 : 808800.1056
-  interstitial vol error : 0.069%  (haptera-only vs fraction target)
-  surface area (w/ cap)  : 246500.3397  (exact (includes flat base cap))
-  wetted surface area    : 239667.5233  (base cap excluded; bore walls included)
-  base cap area          : 6832.8164
+  volume                 : 1046785.1937
+  interstitial vol error : 0.035%  (haptera-only vs fraction target)
+  surface area (w/ cap)  : 257206.9081  (exact (includes flat base cap))
+  wetted surface area    : 236339.4775  (base cap excluded; bore walls included)
+  base cap area          : 20867.4305
 
 Pocket / mold (centered on cone axis, bottom-open)
   cube dimensions        : 103.5 × 89.0 × 40.0  (target dive-weight footprint)
-  cavity dimensions      : 107.50 × 93.00 × 42.00  (cube + 2.0 mm clearance)
-  outer dimensions       : 105.50 × 91.00 × 41.00  (cavity + 1.0 mm walls/top slab)
+  cavity dimensions      : 105.50 × 91.00 × 42.00  (cube + 1.0 mm clearance, +1.0 mm overshoot)
+  outer dimensions       : 107.50 × 93.00 × 41.00  (cavity + 1.0 mm walls/top slab)
   z range                : [0.00, 41.00]  (POCKET_Z_BASE → top slab)
-  outer block volume     : 426502.5000  (analytical, full cube of mold)
+  outer block volume     : 409897.5000  (analytical, full cube of mold)
   cube/cavity volume     : 368460.0000  (analytical, treated as full for interstitial calc)
-  wall+top volume        : 58042.5000  (analytical, outer − cube)
+  wall+top volume        : 41437.5000  (analytical, outer − cube)
   full STL (analysis)    : cavity solid; feed to pocket_analysis.py
   empty STL (3D-print)   : cavity hollow; print this and slide the dive weight up from below
 
@@ -85,15 +85,15 @@ Cone (design reference)
   base area              : 53092.9158  (excluded — open base)
 
 Convex hull (actual bounding envelope)
-  hull volume            : 2310481.7878
-  hull surface area      : 117361.8034
+  hull volume            : 2232765.6583
+  hull surface area      : 118350.8768
 
 Interstitial space
-  volume (total)         : 1501681.6822  (hull − haptera; includes all bore voids)
-  volume (haptera only)  : 1486979.0286  (vert bore excluded; matches calibration target)
+  volume (total)         : 1185980.4647  (hull − haptera; includes all bore voids)
+  volume (haptera only)  : 1171277.8110  (vert bore excluded; matches calibration target)
   vert bore volume       : 14702.6536  (VERT_HOLE contribution)
   bore wall area         : 4900.8845  (vert + horiz bore lateral walls, analytical)
-  external surface area  : 122262.6880  (hull surface + all bore walls)
-  internal surface area  : 246500.3397  (haptera mesh; all bore walls included)
-  total bounding area    : 318829.2600  (external + internal; ground-contact faces excluded)
-  SA / volume ratio      : 0.1596  (complexity index using total wetted SA)
+  external surface area  : 123251.7613  (hull surface + all bore walls)
+  internal surface area  : 257206.9081  (haptera mesh; all bore walls included)
+  total bounding area    : 313088.6070  (external + internal; ground-contact faces excluded)
+  SA / volume ratio      : 0.1993  (complexity index using total wetted SA)
