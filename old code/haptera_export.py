@@ -36,11 +36,42 @@ MAX_ITERS = 40
 # Defined here so targets below can reference cone volume.
 CONE_H = 130
 CONE_R = 130
+VERT_BOSS_R  = 0   # radius of solid central vertical boss cylinder (must be > VERT_HOLE_R); set to 0 to disable
+VERT_HOLE_R  = 0   # radius of central vertical through-hole drilled through the boss; set to 0 to disable
 HORIZ_BOSS_R = 9   # outer radius of horizontal bossed cylinders that bisect the haptera; set to 0 to disable
 HORIZ_HOLE_R = 7   # inner bore radius of horizontal bossed cylinders; set to 0 to disable
 HORIZ_N      = 2   # number of horizontal cylinders: 1 = single centered cylinder, 2 = two at ±HORIZ_S/2
 HORIZ_S      = 100  # center-to-center spacing in Y between the two cylinders (ignored when HORIZ_N = 1)
 HORIZ_H      = 30  # height above the haptera base for horizontal cylinder centers
+
+# ── anchor bolt cylinders ─────────────────────────────────────────────────────
+# Vertical bossed cylinders providing through-holes for sleeve bolts that
+# anchor the haptera to a substrate.  Each cylinder sits on the print bed
+# (bottom at z = 0), rises to z = ANCHOR_H, and has an annular cross-section
+# (outer radius ANCHOR_BOSS_R, inner bore radius ANCHOR_HOLE_R).  ANCHOR_N
+# cylinders are arranged at evenly-spaced angles around the cone axis at
+# radial distance ANCHOR_R_POS.  Set ANCHOR_BOSS_R = 0 to disable.
+ANCHOR_N      = 0    # number of anchor cylinders evenly spaced around the cone axis
+ANCHOR_BOSS_R = 0    # outer radius of the anchor boss (annular wall outer); 0 = disable
+ANCHOR_HOLE_R = 0    # inner bore radius (sleeve-bolt clearance); 0 = solid boss (no hole)
+ANCHOR_H      = 30   # height of the anchor cylinders above z = 0 (mm)
+ANCHOR_R_POS  = 100  # radial distance from cone axis to each cylinder center (mm)
+ANCHOR_PHASE  = 0.0  # angular offset (radians) applied to the first cylinder
+
+# ── pocket / dive-weight mold (centered on the cone axis) ─────────────────────
+# Open-top mold sized to receive a rectangular cube (the dive weight model).
+# Centered at x = y = 0; the outer floor sits at z = POCKET_Z_BASE and the
+# cavity opens upward (toward +Z, i.e. the cone apex) so the cube can be
+# dropped in vertically.  For the iteration target and the *_full.stl export
+# the cavity is treated as solid (cube in place); the *_empty.stl export
+# (used for 3D printing) hollows the cavity by subtracting it back out.
+# Set POCKET_X = 0 to disable the mold entirely.
+POCKET_X         = 0 #103.5  # cube length along X (mm); 0 = disable
+POCKET_Y         = 0 #89.0  # cube width  along Y (mm)
+POCKET_Z         = 0 #40.0  # cube height along Z (mm)
+POCKET_CLEARANCE =   1.0 # gap between cube and cavity wall on the four side faces (mm)
+POCKET_WALL      =   1.0  # mold wall thickness — floor and four sides (mm)
+POCKET_Z_BASE    =   0.0  # z-coordinate of the bottom face of the mold's outer floor
 
 SIMPLIFY_TARGET = 6000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
 
@@ -87,7 +118,16 @@ if _OUTPUT_DIR != '.':
     os.makedirs(_OUTPUT_DIR, exist_ok=True)
 def _outpath(name):
     return os.path.join(_OUTPUT_DIR, name) if _OUTPUT_DIR != '.' else name
-OUTPUT      = _outpath(f"{_OUTPUT_BASE}.stl")
+# When the pocket is enabled we ship two STLs: the empty mold for 3D printing
+# and the full mold (cube in place) for pocket_analysis.py.  When disabled we
+# fall back to a single STL with the legacy filename.
+if POCKET_X > 0:
+    OUTPUT_EMPTY = _outpath(f"{_OUTPUT_BASE}_empty.stl")   # for 3D printing
+    OUTPUT_FULL  = _outpath(f"{_OUTPUT_BASE}_full.stl")    # for pocket_analysis.py
+else:
+    OUTPUT_EMPTY = _outpath(f"{_OUTPUT_BASE}.stl")
+    OUTPUT_FULL  = None
+OUTPUT      = OUTPUT_EMPTY                       # legacy alias used by reporting
 TEXT_OUTPUT = _outpath(f"{_OUTPUT_BASE}.txt")
 
 
@@ -680,6 +720,10 @@ if DEBUG:
 else:
     print(f"  {len(segs)} segments generated")
 
+# ── hole volume correction (used in iteration error and final report) ─────────
+hole_volume       = np.pi * VERT_HOLE_R**2 * CONE_H if VERT_HOLE_R > 0 else 0.0
+hole_lateral_area = 2 * np.pi * VERT_HOLE_R * CONE_H if VERT_HOLE_R > 0 else 0.0
+
 # ── boss/hole manifolds (pre-built once, reused each iteration) ───────────────
 from manifold3d import Manifold as _Manifold, Mesh as _MfdMesh
 
@@ -1002,12 +1046,22 @@ def _make_watertight(mesh, aggressive=False):
         mesh.invert()
     return mesh
 
+_vert_boss_manifold  = None
+_vert_hole_manifold  = None
 # Horizontal boss and hole manifolds stored separately so they can be applied
-# with the correct CSG operations: boss uses (+boss) to union a clean solid,
+# with the correct CSG operations: boss uses (-boss + boss) to union a clean solid,
 # hole uses (-hole) to subtract.  Pre-combining them as an annular tube and then
 # subtracting would invert both operations (haptera - (outer-inner) = haptera - outer + inner).
 _horiz_boss_manifolds = []
 _horiz_hole_manifolds = []
+if VERT_BOSS_R > 0:
+    _boss_cyl = trimesh.creation.cylinder(radius=VERT_BOSS_R, height=CONE_H, sections=64)
+    _boss_cyl.apply_translation([0.0, 0.0, CONE_H / 2.0])
+    _vert_boss_manifold = _trimesh_to_mfd(_boss_cyl)
+if VERT_HOLE_R > 0:
+    _hole_cyl = trimesh.creation.cylinder(radius=VERT_HOLE_R, height=CONE_H * 3, sections=64)
+    _hole_cyl.apply_translation([0.0, 0.0, CONE_H / 2.0])
+    _vert_hole_manifold = _trimesh_to_mfd(_hole_cyl)
 if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
     # Horizontal cylinders are oriented along the X-axis, positioned at z = HORIZ_H.
     # HORIZ_N=1 → single cylinder centered at y=0; HORIZ_N=2 → two at y=±HORIZ_S/2.
@@ -1056,11 +1110,83 @@ if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
             ).rotate([0.0, 90.0, 0.0]).translate([0.0, _y_off, HORIZ_H])
             _horiz_hole_manifolds.append(_inner_mfd)
 
+# ── anchor cylinder manifolds (pre-built once, reused each iteration) ─────────
+# ANCHOR_N vertical cylinders evenly spaced around the cone axis at radial
+# distance ANCHOR_R_POS.  Bosses are unioned into the haptera; bores are
+# subtracted to drill the sleeve-bolt clearance through each boss.
+_anchor_boss_manifolds = []
+_anchor_hole_manifolds = []
+if ANCHOR_BOSS_R > 0 and ANCHOR_N > 0:
+    for _i in range(ANCHOR_N):
+        _ang = 2.0 * np.pi * _i / ANCHOR_N + ANCHOR_PHASE
+        _ax  = ANCHOR_R_POS * np.cos(_ang)
+        _ay  = ANCHOR_R_POS * np.sin(_ang)
+        _aboss_cyl = trimesh.creation.cylinder(radius=ANCHOR_BOSS_R, height=ANCHOR_H, sections=64)
+        _aboss_cyl.apply_translation([_ax, _ay, ANCHOR_H / 2.0])
+        _anchor_boss_manifolds.append(_trimesh_to_mfd(_aboss_cyl))
+        if ANCHOR_HOLE_R > 0:
+            # Oversize the bore vertically (3× height) so it punches cleanly through
+            # the boss without coplanar end-cap artefacts; trim_below cleans the
+            # portion that drops past z = 0.  Mirrors the VERT_HOLE_R pattern.
+            _ahole_cyl = trimesh.creation.cylinder(radius=ANCHOR_HOLE_R, height=ANCHOR_H * 3.0, sections=64)
+            _ahole_cyl.apply_translation([_ax, _ay, ANCHOR_H / 2.0])
+            _anchor_hole_manifolds.append(_trimesh_to_mfd(_ahole_cyl))
+
+# ── pocket / mold manifolds (pre-built once, reused each iteration) ───────────
+# _pocket_outer_manifold:  full outer block — used in iteration to carve haptera
+#                          out of the mold region and add a clean solid block in
+#                          its place (so volume calcs treat the cavity as full).
+# _pocket_cavity_manifold: cavity solid that punches up through the outer block —
+#                          subtracted once after convergence to make the empty
+#                          (printable) version.
+# _pocket_outer_volume:    analytical volume of the outer block (mold + cube),
+#                          and _pocket_cube_volume is the cube alone; both are
+#                          surfaced in the final report.
+_pocket_outer_manifold  = None
+_pocket_cavity_manifold = None
+_pocket_outer_volume    = 0.0
+_pocket_cube_volume     = 0.0
+_pocket_wall_volume     = 0.0
+if POCKET_X > 0:
+    # Outer block grows with both clearance and wall thickness so the side
+    # walls retain POCKET_WALL of material no matter how large the clearance.
+    _pocket_out_x = POCKET_X + 2.0 * POCKET_CLEARANCE + 2.0 * POCKET_WALL
+    _pocket_out_y = POCKET_Y + 2.0 * POCKET_CLEARANCE + 2.0 * POCKET_WALL
+    _pocket_out_z = POCKET_Z + POCKET_WALL                # cavity-height walls + top slab
+    _pocket_outer_box = trimesh.creation.box(extents=[_pocket_out_x, _pocket_out_y, _pocket_out_z])
+    _pocket_outer_box.apply_translation([0.0, 0.0, POCKET_Z_BASE + _pocket_out_z / 2.0])
+    _pocket_outer_manifold = _trimesh_to_mfd(_pocket_outer_box)
+
+    # Cavity extends past the bottom of the outer block so the boolean cleanly
+    # punches through to leave an open bottom.  The top of the cavity meets the
+    # underside of the top slab (z = POCKET_Z_BASE + POCKET_Z); the cube hangs
+    # from it and slides out the open bottom for fit-checking.
+    _pocket_overshoot = POCKET_WALL
+    _pocket_cav_x = POCKET_X + 2.0 * POCKET_CLEARANCE
+    _pocket_cav_y = POCKET_Y + 2.0 * POCKET_CLEARANCE
+    _pocket_cav_z = POCKET_Z + POCKET_CLEARANCE + _pocket_overshoot
+    _pocket_cavity_box = trimesh.creation.box(extents=[_pocket_cav_x, _pocket_cav_y, _pocket_cav_z])
+    _pocket_cavity_box.apply_translation([
+        0.0, 0.0,
+        POCKET_Z_BASE + POCKET_Z - _pocket_cav_z / 2.0,
+    ])
+    _pocket_cavity_manifold = _trimesh_to_mfd(_pocket_cavity_box)
+
+    _pocket_outer_volume = _pocket_out_x * _pocket_out_y * _pocket_out_z
+    _pocket_cube_volume  = POCKET_X * POCKET_Y * POCKET_Z
+    _pocket_wall_volume  = _pocket_outer_volume - _pocket_cube_volume
+
 # ── below-base trim manifold (always applied to flatten the print bed) ────────
 # Spheres at every endpoint extend down to z = endpoint_z - r.  Endpoints
 # clipped to the cone base land near z = 0, so their spheres dangle beneath
-# z = 0.  Subtracting a half-space at z < TRIM_BOTTOM_EPS removes every
-# sphere fragment below the print bed in one CSG op.  Built once and
+# z = 0 — and nothing else cuts them: the pocket outer envelope starts at
+# z = 0, and the cavity overshoot only reaches z = -POCKET_WALL within the
+# cavity xy footprint, leaving sphere fragments outside the cavity uncut.
+# Subtracting a half-space at z < TRIM_BOTTOM_EPS removes every sphere
+# fragment below the print bed in one CSG op, both for the analysis (full)
+# mesh and the printable (empty) mesh.  The tiny negative offset keeps the
+# trim's top face from being coplanar with the pocket's bottom face at
+# z = 0, which would create degenerate boolean output.  Built once and
 # reused per iteration.
 TRIM_BOTTOM_EPS  = -1e-3
 _trim_extent     = max(CONE_R, CONE_H) * 4.0
@@ -1068,7 +1194,7 @@ _trim_below_box  = trimesh.creation.box(extents=[_trim_extent, _trim_extent, _tr
 _trim_below_box.apply_translation([0.0, 0.0, TRIM_BOTTOM_EPS - _trim_extent / 2.0])
 _trim_below_manifold = _trimesh_to_mfd(_trim_below_box)
 
-print(f"\nIterating to interstitial fraction (target={TARGET_INTERSTITIAL_FRACTION:.6f} × hull, tol={TOLERANCE*100:.2f}%)...")
+print(f"\nIterating to interstitial fraction (target={TARGET_INTERSTITIAL_FRACTION:.6f} × (hull − pocket), tol={TOLERANCE*100:.2f}%)...")
 try:
     from tqdm import tqdm as _tqdm
     _ibar = _tqdm(total=MAX_ITERS, desc="  volume iters", unit="iter",
@@ -1093,17 +1219,37 @@ for iteration in range(1, MAX_ITERS + 1):
     _tm = _time.perf_counter()
     measured_vol = manifold.volume()
     _dlog(f"    [measure_vol] done  {_time.perf_counter()-_tm:.4f}s  vol={measured_vol:.4f}")
-    # Apply horizontal boss/hole and trim ops with simple +/-.  manifold3d's
-    # union drops interior surfaces, so a direct +boss keeps the topology
-    # clean without needing a purge-then-add pattern.
+    # Apply boss/hole to get the final-mesh manifold for this iteration.
+    # Subtract boss first to cleanly remove any haptera inside the boss region,
+    # then union the boss back in — this prevents interior haptera surfaces from
+    # persisting inside the boss, which would inflate the surface area calculation.
+    # Apply boss/hole/pocket/trim ops with simple +/- (no purge-then-add).  An
+    # earlier version used the (m - B) + B pattern to "purge haptera surfaces
+    # inside the boss"; in manifold3d ≥3.4 that pattern leaves dozens of
+    # thin sliver bodies along the boss/haptera interface (decompose() jumps
+    # from 37 to 110 pieces at DEPTH=4) even though the resulting volume is
+    # identical to a plain union.  Direct +/- ops keep the topology clean and
+    # manifold3d's union already drops interior surfaces, so the original
+    # surface-area concern doesn't apply.
     m_final = manifold
+    if _vert_boss_manifold is not None:
+        m_final = m_final + _vert_boss_manifold
     for _hboss in _horiz_boss_manifolds:
         m_final = m_final + _hboss
     for _hhole in _horiz_hole_manifolds:
         m_final = m_final - _hhole
+    for _aboss in _anchor_boss_manifolds:
+        m_final = m_final + _aboss
+    for _ahole in _anchor_hole_manifolds:
+        m_final = m_final - _ahole
+    if _pocket_outer_manifold is not None:
+        m_final = m_final + _pocket_outer_manifold
+    if _vert_hole_manifold is not None:
+        m_final = m_final - _vert_hole_manifold
     # Flatten the print bed by trimming everything below z = 0.  This removes
     # sphere fragments dangling from endpoints that were clipped to the cone
-    # base.
+    # base, which the pocket subtraction leaves behind because they sit
+    # outside the cavity xy footprint.
     m_final = m_final - _trim_below_manifold
     combined_iter = _manifold_to_trimesh(m_final, _dlog)
     # ── watertight repair: collapse duplicate vertices and plug any holes ─────
@@ -1126,8 +1272,11 @@ for iteration in range(1, MAX_ITERS + 1):
     hull_vol_iter = combined_iter.convex_hull.volume
     _dlog(f"    [measure_hull] done  {_time.perf_counter()-_tm:.4f}s  hull_vol={hull_vol_iter:.4f}")
     final_vol_iter    = combined_iter.volume
-    interstitial_iter   = hull_vol_iter - final_vol_iter
-    _target_interstitial = TARGET_INTERSTITIAL_FRACTION * hull_vol_iter
+    interstitial_iter   = hull_vol_iter - final_vol_iter - hole_volume
+    # Dynamic target: desired haptera-only interstitial = fraction of (hull − pocket) minus vert bore void.
+    # The pocket outer block is treated as occupied space, so it is removed
+    # from the available envelope before applying the interstitial fraction.
+    _target_interstitial = TARGET_INTERSTITIAL_FRACTION * (hull_vol_iter - _pocket_outer_volume) - hole_volume
     error = abs(interstitial_iter - _target_interstitial) / _target_interstitial
     msg   = f"  iter {iteration}: interstitial={interstitial_iter:.4f}  haptera={final_vol_iter:.4f}  error={error*100:.3f}%"
     if error <= TOLERANCE:
@@ -1135,17 +1284,21 @@ for iteration in range(1, MAX_ITERS + 1):
         if _ibar: _ibar.update(1)
         combined  = combined_iter
         final_vol = final_vol_iter
+        final_mfd = m_final  # keep the manifold3d version for cavity subtraction
         break
     # Correction steered on raw haptera volume (before boss/hole) since only tube radii are scaled.
-    haptera_target = hull_vol_iter - _target_interstitial - (m_final.volume() - measured_vol)
+    # m_final.volume() = V(haptera+boss) - hole_volume, so (m_final.volume()-measured_vol) already
+    # bakes in -hole_volume; subtract it again to recover the correct net boss contribution.
+    haptera_target = hull_vol_iter - _target_interstitial - (m_final.volume() - measured_vol) - hole_volume
     if haptera_target <= 0:
         haptera_target = BASE_VOLUME
     if haptera_target <= 0:
-        _log(f"  ! TARGET_INTERSTITIAL_FRACTION ({TARGET_INTERSTITIAL_FRACTION}) × hull "
-             f"({hull_vol_iter:.4f}) — target is geometrically infeasible for this tree. "
+        _log(f"  ! TARGET_INTERSTITIAL_FRACTION ({TARGET_INTERSTITIAL_FRACTION}) × (hull − pocket) "
+             f"({hull_vol_iter - _pocket_outer_volume:.4f}) — target is geometrically infeasible for this tree. "
              f"Lower TARGET_INTERSTITIAL_FRACTION and re-run.")
         combined  = combined_iter
         final_vol = final_vol_iter
+        final_mfd = m_final
         break
     if interstitial_iter > _target_interstitial:
         lo_factor = cumulative_factor
@@ -1183,6 +1336,7 @@ for iteration in range(1, MAX_ITERS + 1):
         _log("  ! max iterations reached")
         combined  = combined_iter
         final_vol = final_vol_iter
+        final_mfd = m_final
 if _ibar: _ibar.close()
 
 
@@ -1191,8 +1345,8 @@ if _ibar: _ibar.close()
 # can drop sliver bodies and re-cap holes, which slightly shifts the volume.
 _pre_repair_haptera_vol      = combined.volume
 _pre_repair_hull_vol         = combined.convex_hull.volume
-_pre_repair_interstitial     = _pre_repair_hull_vol - _pre_repair_haptera_vol
-_pre_repair_target_iv        = TARGET_INTERSTITIAL_FRACTION * _pre_repair_hull_vol
+_pre_repair_interstitial     = _pre_repair_hull_vol - _pre_repair_haptera_vol - hole_volume
+_pre_repair_target_iv        = TARGET_INTERSTITIAL_FRACTION * (_pre_repair_hull_vol - _pocket_outer_volume) - hole_volume
 _pre_repair_error            = abs(_pre_repair_interstitial - _pre_repair_target_iv) / _pre_repair_target_iv if _pre_repair_target_iv > 0 else float('nan')
 
 # Final watertight pass so the exported STLs are sealed regardless of how the
@@ -1207,8 +1361,8 @@ _make_watertight(combined, aggressive=True)
 # repair-induced delta visible separately from the final analysis report.
 _post_repair_haptera_vol     = combined.volume
 _post_repair_hull_vol        = combined.convex_hull.volume
-_post_repair_interstitial    = _post_repair_hull_vol - _post_repair_haptera_vol
-_post_repair_target_iv       = TARGET_INTERSTITIAL_FRACTION * _post_repair_hull_vol
+_post_repair_interstitial    = _post_repair_hull_vol - _post_repair_haptera_vol - hole_volume
+_post_repair_target_iv       = TARGET_INTERSTITIAL_FRACTION * (_post_repair_hull_vol - _pocket_outer_volume) - hole_volume
 _post_repair_error           = abs(_post_repair_interstitial - _post_repair_target_iv) / _post_repair_target_iv if _post_repair_target_iv > 0 else float('nan')
 _repair_vol_delta            = _post_repair_haptera_vol - _pre_repair_haptera_vol
 _repair_iv_delta             = _post_repair_interstitial - _pre_repair_interstitial
@@ -1219,9 +1373,33 @@ print(f"  post-repair : interstitial={_post_repair_interstitial:.4f}  haptera={_
 print(f"  repair Δ    : haptera={_repair_vol_delta:+.4f}  interstitial={_repair_iv_delta:+.4f}  "
       f"({'within' if _post_repair_error <= TOLERANCE else 'OUTSIDE'} tol={TOLERANCE*100:.2f}%)")
 
-if DEBUG: print(f"[export] writing {OUTPUT}...")
+# `combined` is the FULL version (cavity treated as solid for volume targeting).
+# Build the EMPTY version (cavity hollow) for 3D printing by subtracting the
+# pre-built cavity manifold *in manifold3d*, on the saved m_final.  This
+# avoids the trimesh→manifold→trimesh round-trip on `combined_full`, which
+# previously amplified non-manifold artifacts.  When the pocket is disabled
+# both names alias the same mesh and only one STL is exported.
+combined_full = combined
+if _pocket_cavity_manifold is not None:
+    if DEBUG: print(f"[pocket] subtracting cavity in manifold3d to build empty version...")
+    _t_pocket = _time.perf_counter()
+    # final_mfd already has z < 0 trimmed inside the iteration loop, so the
+    # cavity subtraction alone produces a clean printable mesh with a flat
+    # base and no sphere fragments dangling beneath the bed.
+    _empty_mfd     = final_mfd - _pocket_cavity_manifold
+    combined_empty = _manifold_to_trimesh(_empty_mfd, lambda _msg: None)
+    _make_watertight(combined_empty, aggressive=True)
+    if DEBUG: print(f"[pocket] done  {_time.perf_counter()-_t_pocket:.2f}s  "
+                    f"({len(combined_empty.vertices)} verts, {len(combined_empty.faces)} faces)")
+else:
+    combined_empty = combined_full
+
+if DEBUG: print(f"[export] writing {OUTPUT_EMPTY}...")
 _t = _time.perf_counter()
-combined.export(OUTPUT)
+combined_empty.export(OUTPUT_EMPTY)
+if OUTPUT_FULL is not None:
+    if DEBUG: print(f"[export] writing {OUTPUT_FULL}...")
+    combined_full.export(OUTPUT_FULL)
 if DEBUG: print(f"[export] done  {_time.perf_counter()-_t:.2f}s")
 sys.stdout = Tee(TEXT_OUTPUT)
 
@@ -1283,23 +1461,48 @@ if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
         horiz_bore_lateral_sa  = sum(2 * np.pi * HORIZ_HOLE_R * _cl for _cl in _chord_lens)
         horiz_tube_sa         += horiz_bore_lateral_sa
 
+# ── anchor cylinder analytical measurements ───────────────────────────────────
+# Each anchor is a vertical annulus of height ANCHOR_H, ANCHOR_N total.
+# Boss volume is the annular solid (outer² − inner²) × π × H, summed across all.
+# Bore displacement is the inner cylinder volume removed from haptera+boss.
+anchor_boss_vol        = 0.0
+anchor_bore_disp_vol   = 0.0
+anchor_tube_sa         = 0.0
+anchor_bore_lateral_sa = 0.0
+if ANCHOR_BOSS_R > 0 and ANCHOR_N > 0:
+    _anchor_solid_r_sq = ANCHOR_BOSS_R**2 - (ANCHOR_HOLE_R**2 if ANCHOR_HOLE_R > 0 else 0.0)
+    anchor_boss_vol    = ANCHOR_N * np.pi * _anchor_solid_r_sq * ANCHOR_H
+    # Surface area: outer cylinder lateral wall + two annular end caps per cylinder.
+    anchor_tube_sa     = ANCHOR_N * (2 * np.pi * ANCHOR_BOSS_R * ANCHOR_H + 2 * np.pi * _anchor_solid_r_sq)
+    if ANCHOR_HOLE_R > 0:
+        anchor_bore_disp_vol   = ANCHOR_N * np.pi * ANCHOR_HOLE_R**2 * ANCHOR_H
+        anchor_bore_lateral_sa = ANCHOR_N * 2 * np.pi * ANCHOR_HOLE_R * ANCHOR_H
+        anchor_tube_sa        += anchor_bore_lateral_sa
+
 # ── interstitial measurements ─────────────────────────────────────────────────
-# Total interstitial: all void space inside the hull (includes horiz bore channel volumes).
+# Total interstitial: all void space inside the hull (includes bore channel volumes).
 # The bore walls are already in haptera_surface_area (they are mesh surfaces), and
 # the bore volumes are already captured in hull_volume - final_vol (final_vol is
-# reduced by drilling).
-interstitial_volume = hull_volume - final_vol           # includes horiz bore voids
+# reduced by drilling).  hole_volume / hole_lateral_area are kept only for the
+# convergence error check so it stays consistent with the calibration target.
+interstitial_volume = hull_volume - final_vol           # includes vert & horiz bore voids
 total_surface_area  = haptera_surface_area - base_cap_area  # includes all bore walls
 # Bore wall area (analytical): lateral wall of every drilled channel.
 # Added to hull_surface_area for external SA so bore channels are not invisible to the hull metric.
-bore_wall_sa        = horiz_bore_lateral_sa
+bore_wall_sa        = hole_lateral_area + horiz_bore_lateral_sa + anchor_bore_lateral_sa
 external_sa         = hull_surface_area + bore_wall_sa  # hull envelope + all bore walls
 internal_sa         = haptera_surface_area              # full haptera mesh (bore walls included)
 total_bounding_area = (external_sa - hull_base_area) + (internal_sa - base_cap_area)  # ground-contact faces excluded
 sa_to_vol           = total_surface_area / interstitial_volume if interstitial_volume > 0 else 0
+# Haptera-only interstitial (excludes vert bore) — used for error vs calibration target.
+interstitial_haptera_only = hull_volume - final_vol - hole_volume
 
 # ── output ────────────────────────────────────────────────────────────────────
-print(f"\nExported : {OUTPUT}")
+if OUTPUT_FULL is not None:
+    print(f"\nExported (3D-print) : {OUTPUT_EMPTY}   [pocket cavity hollow]")
+    print(f"Exported (analysis) : {OUTPUT_FULL}    [pocket cavity treated as full]")
+else:
+    print(f"\nExported : {OUTPUT_EMPTY}")
 print(f"")
 print(f"Parameters")
 print(f"  depth                  : {DEPTH}")
@@ -1311,12 +1514,26 @@ print(f"  steer_onset            : {STEER_ONSET}")
 print(f"  steer_strength         : {STEER_STRENGTH}")
 print(f"  cone_h                 : {CONE_H}")
 print(f"  cone_r                 : {CONE_R}")
+print(f"  vert_boss_r            : {VERT_BOSS_R}")
+print(f"  vert_hole_r            : {VERT_HOLE_R}")
 print(f"  horiz_boss_r           : {HORIZ_BOSS_R}")
 print(f"  horiz_hole_r           : {HORIZ_HOLE_R}")
 print(f"  horiz_n                : {HORIZ_N}")
 print(f"  horiz_s                : {HORIZ_S}{'  (ignored — single cylinder)' if HORIZ_N == 1 else ''}")
 print(f"  horiz_h                : {HORIZ_H}")
-print(f"  target_interstitial_frac: {TARGET_INTERSTITIAL_FRACTION:.6f}  (fraction of hull)")
+print(f"  anchor_n               : {ANCHOR_N}{'  (anchors disabled)' if ANCHOR_BOSS_R <= 0 or ANCHOR_N <= 0 else ''}")
+print(f"  anchor_boss_r          : {ANCHOR_BOSS_R}")
+print(f"  anchor_hole_r          : {ANCHOR_HOLE_R}")
+print(f"  anchor_h               : {ANCHOR_H}")
+print(f"  anchor_r_pos           : {ANCHOR_R_POS}")
+print(f"  anchor_phase           : {ANCHOR_PHASE}")
+print(f"  pocket_x               : {POCKET_X}{'  (mold disabled)' if POCKET_X <= 0 else ''}")
+print(f"  pocket_y               : {POCKET_Y}")
+print(f"  pocket_z               : {POCKET_Z}")
+print(f"  pocket_clearance       : {POCKET_CLEARANCE}")
+print(f"  pocket_wall            : {POCKET_WALL}")
+print(f"  pocket_z_base          : {POCKET_Z_BASE}")
+print(f"  target_interstitial_frac: {TARGET_INTERSTITIAL_FRACTION:.6f}  (fraction of hull − pocket)")
 print(f"  base_volume (haptera)  : {BASE_VOLUME:.4f}")
 print(f"")
 print(f"Mesh")
@@ -1358,11 +1575,15 @@ def _solidity_report(label, mesh):
     print(f"  {'volume':<22} : {mesh.volume:.4f}")
     print(f"")
 
-_solidity_report("Solidity", combined)
+if OUTPUT_FULL is not None:
+    _solidity_report("Solidity (full STL — analysis mesh)",  combined_full)
+    _solidity_report("Solidity (empty STL — printable mesh)", combined_empty)
+else:
+    _solidity_report("Solidity", combined_empty)
 print(f"Haptera")
 print(f"  volume                 : {final_vol:.4f}")
-_final_target_iv = TARGET_INTERSTITIAL_FRACTION * hull_volume
-print(f"  interstitial vol error : {abs(interstitial_volume - _final_target_iv) / _final_target_iv * 100:.3f}%  (vs fraction target)")
+_final_target_iv = TARGET_INTERSTITIAL_FRACTION * (hull_volume - _pocket_outer_volume) - hole_volume
+print(f"  interstitial vol error : {abs(interstitial_haptera_only - _final_target_iv) / _final_target_iv * 100:.3f}%  (haptera-only vs fraction target)")
 print(f"  surface area (w/ cap)  : {haptera_surface_area:.4f}  ({area_note})")
 print(f"  wetted surface area    : {total_surface_area:.4f}  (base cap excluded; bore walls included)")
 print(f"  base cap area          : {base_cap_area:.4f}")
@@ -1376,6 +1597,25 @@ if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
         print(f"  bore displacement vol  : {horiz_bore_disp_vol:.4f}  (volume drilled out of haptera+boss)")
     print(f"  surface area           : {horiz_tube_sa:.4f}  (boss outer + end caps + bore walls)")
     print(f"")
+if ANCHOR_BOSS_R > 0 and ANCHOR_N > 0:
+    print(f"Anchor cylinders (analytical, N={ANCHOR_N} @ r={ANCHOR_R_POS} mm, h={ANCHOR_H} mm)")
+    print(f"  boss solid vol added   : {anchor_boss_vol:.4f}  (annular solid unioned into haptera)")
+    if ANCHOR_HOLE_R > 0:
+        print(f"  bore displacement vol  : {anchor_bore_disp_vol:.4f}  (sleeve-bolt clearance drilled out)")
+    print(f"  surface area           : {anchor_tube_sa:.4f}  (boss outer + end caps + bore walls)")
+    print(f"")
+if POCKET_X > 0:
+    print(f"Pocket / mold (centered on cone axis, bottom-open)")
+    print(f"  cube dimensions        : {POCKET_X} × {POCKET_Y} × {POCKET_Z}  (target dive-weight footprint)")
+    print(f"  cavity dimensions      : {POCKET_X + 2*POCKET_CLEARANCE:.2f} × {POCKET_Y + 2*POCKET_CLEARANCE:.2f} × {POCKET_Z + POCKET_CLEARANCE + POCKET_WALL:.2f}  (cube + {POCKET_CLEARANCE} mm clearance, +{POCKET_WALL} mm overshoot)")
+    print(f"  outer dimensions       : {POCKET_X + 2*POCKET_CLEARANCE + 2*POCKET_WALL:.2f} × {POCKET_Y + 2*POCKET_CLEARANCE + 2*POCKET_WALL:.2f} × {POCKET_Z + POCKET_WALL:.2f}  (cavity + {POCKET_WALL} mm walls/top slab)")
+    print(f"  z range                : [{POCKET_Z_BASE:.2f}, {POCKET_Z_BASE + POCKET_Z + POCKET_WALL:.2f}]  (POCKET_Z_BASE → top slab)")
+    print(f"  outer block volume     : {_pocket_outer_volume:.4f}  (analytical, full cube of mold)")
+    print(f"  cube/cavity volume     : {_pocket_cube_volume:.4f}  (analytical, treated as full for interstitial calc)")
+    print(f"  wall+top volume        : {_pocket_wall_volume:.4f}  (analytical, outer − cube)")
+    print(f"  full STL (analysis)    : cavity solid; feed to pocket_analysis.py")
+    print(f"  empty STL (3D-print)   : cavity hollow; print this and slide the dive weight up from below")
+    print(f"")
 print(f"Cone (design reference)")
 print(f"  total volume           : {cone_volume:.4f}")
 print(f"  lateral surface area   : {cone_lateral_area:.4f}")
@@ -1386,10 +1626,15 @@ print(f"  hull volume            : {hull_volume:.4f}")
 print(f"  hull surface area      : {hull_surface_area:.4f}")
 print(f"")
 print(f"Interstitial space")
-print(f"  volume                 : {interstitial_volume:.4f}  (hull − haptera; includes horiz bore voids)")
+print(f"  volume (total)         : {interstitial_volume:.4f}  (hull − haptera; includes all bore voids)")
+print(f"  volume (haptera only)  : {interstitial_haptera_only:.4f}  (vert bore excluded; matches calibration target)")
+if hole_volume > 0:
+    print(f"  vert bore volume       : {hole_volume:.4f}  (VERT_HOLE contribution)")
 if HORIZ_HOLE_R > 0:
     print(f"  horiz bore volume      : {horiz_bore_disp_vol:.4f}  (HORIZ_HOLE contribution, analytical)")
-print(f"  bore wall area         : {bore_wall_sa:.4f}  (horiz bore lateral walls, analytical)")
+if ANCHOR_HOLE_R > 0 and ANCHOR_N > 0:
+    print(f"  anchor bore volume     : {anchor_bore_disp_vol:.4f}  (ANCHOR_HOLE contribution, analytical)")
+print(f"  bore wall area         : {bore_wall_sa:.4f}  (vert + horiz bore lateral walls, analytical)")
 print(f"  external surface area  : {external_sa:.4f}  (hull surface + all bore walls)")
 print(f"  internal surface area  : {internal_sa:.4f}  (haptera mesh; all bore walls included)")
 print(f"  total bounding area    : {total_bounding_area:.4f}  (external + internal; ground-contact faces excluded)")
