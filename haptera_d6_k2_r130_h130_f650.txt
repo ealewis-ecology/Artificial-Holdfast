@@ -11,53 +11,39 @@ Parameters
   steer_strength         : 1.1
   cone_h                 : 130
   cone_r                 : 130
-  vert_boss_r            : 0
-  vert_hole_r            : 0
   horiz_boss_r           : 9
   horiz_hole_r           : 7
   horiz_n                : 2
   horiz_s                : 100
   horiz_h                : 30
-  anchor_n               : 0  (anchors disabled)
-  anchor_boss_r          : 0
-  anchor_hole_r          : 0
-  anchor_h               : 30
-  anchor_r_pos           : 100
-  anchor_phase           : 0.0
-  pocket_x               : 0  (mold disabled)
-  pocket_y               : 0
-  pocket_z               : 0
-  pocket_clearance       : 1.0
-  pocket_wall            : 1.0
-  pocket_z_base          : 0.0
-  target_interstitial_frac: 0.650387  (fraction of hull − pocket)
+  target_interstitial_frac: 0.650387  (fraction of hull)
   base_volume (haptera)  : 804352.8790
 
 Mesh
   segments               : 4931
-  vertices               : 650548
-  faces                  : 1320785
+  vertices               : 656576
+  faces                  : 1330904
 
 Solidity
-  is_volume (solid)      : FAIL
-  watertight             : FAIL
-  winding consistent     : FAIL
+  is_volume (solid)      : PASS
+  watertight             : PASS
+  winding consistent     : PASS
   positive volume        : PASS
-  manifold edges         : FAIL
-  no open boundary       : FAIL
-  boundary edges         : 91  (>0 = open holes)
-  non-manifold edges     : 7  (>0 = T-junctions / overlaps)
-  broken faces           : 112  (faces touching a bad edge)
-  connected bodies       : 43  (>1 = floating shells)
-  euler characteristic   : -9884  (closed genus-g surface = 2 - 2g)
-  volume                 : 762937.8305
+  manifold edges         : PASS
+  no open boundary       : PASS
+  boundary edges         : 0  (>0 = open holes)
+  non-manifold edges     : 0  (>0 = T-junctions / overlaps)
+  broken faces           : 0  (faces touching a bad edge)
+  connected bodies       : 99  (>1 = floating shells)
+  euler characteristic   : -8876  (closed genus-g surface = 2 - 2g)
+  volume                 : 762938.2390
 
 Haptera
-  volume                 : 762937.8305
-  interstitial vol error : 1.274%  (haptera-only vs fraction target)
-  surface area (w/ cap)  : 690147.4595  (exact (includes flat base cap))
-  wetted surface area    : 670430.0729  (base cap excluded; bore walls included)
-  base cap area          : 19717.3866
+  volume                 : 762938.2390
+  interstitial vol error : 0.051%  (vs fraction target)
+  surface area (w/ cap)  : 687025.9477  (exact (includes flat base cap))
+  wetted surface area    : 667820.1342  (base cap excluded; bore walls included)
+  base cap area          : 19205.8135
 
 Horizontal cylinders (analytical, both cylinders)
   boss solid vol added   : 34824.9478  (annular solid unioned into haptera)
@@ -70,15 +56,14 @@ Cone (design reference)
   base area              : 53092.9158  (excluded — open base)
 
 Convex hull (actual bounding envelope)
-  hull volume            : 2235211.1437
-  hull surface area      : 119901.6302
+  hull volume            : 2184294.6471
+  hull surface area      : 118716.3916
 
 Interstitial space
-  volume (total)         : 1472273.3132  (hull − haptera; includes all bore voids)
-  volume (haptera only)  : 1472273.3132  (vert bore excluded; matches calibration target)
+  volume                 : 1421356.4082  (hull − haptera; includes horiz bore voids)
   horiz bore volume      : 53325.7013  (HORIZ_HOLE contribution, analytical)
-  bore wall area         : 15235.9147  (vert + horiz bore lateral walls, analytical)
-  external surface area  : 135137.5448  (hull surface + all bore walls)
-  internal surface area  : 690147.4595  (haptera mesh; all bore walls included)
-  total bounding area    : 757987.9115  (external + internal; ground-contact faces excluded)
-  SA / volume ratio      : 0.4554  (complexity index using total wetted SA)
+  bore wall area         : 15235.9147  (horiz bore lateral walls, analytical)
+  external surface area  : 133952.3063  (hull surface + all bore walls)
+  internal surface area  : 687025.9477  (haptera mesh; all bore walls included)
+  total bounding area    : 754215.4481  (external + internal; ground-contact faces excluded)
+  SA / volume ratio      : 0.4698  (complexity index using total wetted SA)
