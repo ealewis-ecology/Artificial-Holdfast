@@ -30,7 +30,16 @@ TUBE_SIDES = 10
 
 # ── convergence ───────────────────────────────────────────────────────────────
 TOLERANCE = 0.001 #0.1%
-MAX_ITERS = 40
+MAX_ITERS = 10
+
+# ── radius caching (speeds up re-runs) ────────────────────────────────────────
+# The convergence loop multiplies every tube radius by a correction factor each
+# iteration.  When the same configuration is run repeatedly, the cumulative
+# correction factor is roughly the same too, so caching it lets a re-run start
+# at (or very near) the converged radius and skip most iterations.
+USE_CACHED_FACTOR  = True   # read CACHE_FILE on startup if it exists and its config matches
+SAVE_CACHED_FACTOR = True   # write CACHE_FILE after the iteration loop
+INITIAL_FACTOR     = None   # manual multiplier override, e.g. 0.873.  Takes precedence over the cache.  None = use cache or 1.0.
 
 # ── cone geometry ─────────────────────────────────────────────────────────────
 # Defined here so targets below can reference cone volume.
@@ -89,6 +98,7 @@ def _outpath(name):
     return os.path.join(_OUTPUT_DIR, name) if _OUTPUT_DIR != '.' else name
 OUTPUT      = _outpath(f"{_OUTPUT_BASE}.stl")
 TEXT_OUTPUT = _outpath(f"{_OUTPUT_BASE}.txt")
+CACHE_FILE  = _outpath(f"{_OUTPUT_BASE}.cache.txt")
 
 
 # ── PRNG ──────────────────────────────────────────────────────────────────────
@@ -597,9 +607,13 @@ def _manifold_to_trimesh(manifold, _log):
     _log("    [extract_mesh] converting Manifold to trimesh...")
     t0 = time.perf_counter()
     r  = manifold.to_mesh64()
+    # np.array(..., copy=True) materializes writable arrays. The manifold3d buffers
+    # are read-only views; passing them straight to trimesh would propagate that
+    # flag and cause simplify_quadric_decimation (Cython) to fail with
+    # "buffer source array is read-only".
     result = trimesh.Trimesh(
-        vertices=r.vert_properties[:, :3],  # slice XYZ; newer manifold3d appends extra property channels
-        faces=r.tri_verts,
+        vertices=np.array(r.vert_properties[:, :3], copy=True),  # slice XYZ; newer manifold3d appends extra property channels
+        faces=np.array(r.tri_verts, copy=True),
         process=False,
         validate=False,
     )
@@ -670,6 +684,113 @@ def build_segments(depth, k):
         scale_radii(segs, np.sqrt(BASE_VOLUME / ref))
     return segs
 
+# ── radius-multiplier cache ───────────────────────────────────────────────────
+def _current_factor_config():
+    """Return the dict of config keys that determine the converged radius
+    multiplier.  Used both to validate cached values and to write the cache so
+    a future run can detect a stale cache when geometry has changed."""
+    return {
+        'DEPTH': DEPTH,
+        'K': K,
+        'N_ROOTS': N_ROOTS,
+        'CONE_H': CONE_H,
+        'CONE_R': CONE_R,
+        'SEG_LEN': SEG_LEN,
+        'STEER_ONSET': STEER_ONSET,
+        'STEER_STRENGTH': STEER_STRENGTH,
+        'TORSION': TORSION,
+        'INTERTWINED': INTERTWINED,
+        'HELIX_TURNS': HELIX_TURNS,
+        'RADIAL_FRACTION': RADIAL_FRACTION,
+        'LANE_BIAS': LANE_BIAS,
+        'NO_INTERSECT': NO_INTERSECT,
+        'REPEL_ONSET': REPEL_ONSET,
+        'REPEL_STRENGTH': REPEL_STRENGTH,
+        'REPEL_RETRIES': REPEL_RETRIES,
+        'TARGET_INTERSTITIAL_FRACTION': TARGET_INTERSTITIAL_FRACTION,
+        'BASE_VOLUME': BASE_VOLUME,
+        'HORIZ_BOSS_R': HORIZ_BOSS_R,
+        'HORIZ_HOLE_R': HORIZ_HOLE_R,
+        'HORIZ_N': HORIZ_N,
+        'HORIZ_S': HORIZ_S,
+        'HORIZ_H': HORIZ_H,
+    }
+
+def _parse_cache_value(s):
+    s = s.strip()
+    if s == 'True':  return True
+    if s == 'False': return False
+    if s == 'None':  return None
+    try: return int(s)
+    except ValueError: pass
+    try: return float(s)
+    except ValueError: pass
+    return s
+
+def _load_cached_factor(path, current_config):
+    """Read a cached multiplier from path.  Returns the multiplier if the cached
+    config matches current_config, else None.  Returns None when the file is
+    absent or unreadable."""
+    if not os.path.exists(path):
+        return None
+    cached = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                cached[key.strip()] = _parse_cache_value(val)
+    except OSError as e:
+        print(f"  ! cache read failed ({e}); starting from scratch")
+        return None
+    multiplier = cached.get('multiplier')
+    if multiplier is None:
+        return None
+    mismatches = []
+    for k, v in current_config.items():
+        if k not in cached:
+            mismatches.append(f"{k} (missing from cache)")
+            continue
+        cv = cached[k]
+        if isinstance(v, float) or isinstance(cv, float):
+            try:
+                if abs(float(v) - float(cv)) > 1e-9:
+                    mismatches.append(f"{k}: cache={cv} current={v}")
+            except (TypeError, ValueError):
+                mismatches.append(f"{k}: cache={cv!r} current={v!r}")
+        elif cv != v:
+            mismatches.append(f"{k}: cache={cv} current={v}")
+    if mismatches:
+        print(f"  ! cache config mismatch — ignoring cached multiplier ({len(mismatches)} differing keys):")
+        for m in mismatches[:5]:
+            print(f"      {m}")
+        if len(mismatches) > 5:
+            print(f"      ...and {len(mismatches) - 5} more")
+        return None
+    return float(multiplier)
+
+def _save_cached_factor(path, current_config, multiplier, final_root_radius,
+                        interstitial_fraction, error, converged):
+    """Write the converged multiplier and the config that produced it to path."""
+    try:
+        with open(path, 'w') as f:
+            f.write("# auto-generated by haptera_export.py — safe to delete.\n")
+            f.write("# 'multiplier' is the cumulative tube-radius scale factor that produced the\n")
+            f.write("# converged interstitial fraction below.  Re-runs with USE_CACHED_FACTOR=True\n")
+            f.write("# read it back and apply it before iteration starts.\n")
+            f.write("# To use it manually instead, copy its value into INITIAL_FACTOR at the top of the script.\n")
+            f.write(f"multiplier={multiplier:.10f}\n")
+            f.write(f"final_root_radius={final_root_radius:.10f}\n")
+            f.write(f"final_interstitial_fraction={interstitial_fraction:.10f}\n")
+            f.write(f"final_error={error:.10f}\n")
+            f.write(f"converged={converged}\n")
+            for k, v in current_config.items():
+                f.write(f"{k}={v}\n")
+    except OSError as e:
+        print(f"  ! cache write failed ({e})")
+
 # ── main ──────────────────────────────────────────────────────────────────────
 import time as _time
 print(f"Building segments (depth={DEPTH}, k={K})...")
@@ -679,6 +800,24 @@ if DEBUG:
     print(f"  [build_segments] done  {_time.perf_counter()-_t:.2f}s  {len(segs)} segments")
 else:
     print(f"  {len(segs)} segments generated")
+
+# ── apply initial radius multiplier (manual or cached) ───────────────────────
+# Manual INITIAL_FACTOR takes precedence so the user can paste a value from a
+# previous run's log; otherwise USE_CACHED_FACTOR reads CACHE_FILE if present
+# and config-compatible.  Either path skips most of the iteration loop on a
+# warm re-run.
+_initial_factor = INITIAL_FACTOR
+_factor_source  = "INITIAL_FACTOR"
+if _initial_factor is None and USE_CACHED_FACTOR:
+    _cached = _load_cached_factor(CACHE_FILE, _current_factor_config())
+    if _cached is not None:
+        _initial_factor = _cached
+        _factor_source  = f"cache ({CACHE_FILE})"
+if _initial_factor is not None and abs(_initial_factor - 1.0) > 1e-9:
+    print(f"  Applying initial radius multiplier ×{_initial_factor:.5f} (from {_factor_source})")
+    scale_radii(segs, _initial_factor)
+else:
+    _initial_factor = 1.0
 
 # ── boss/hole manifolds (pre-built once, reused each iteration) ───────────────
 from manifold3d import Manifold as _Manifold, Mesh as _MfdMesh
@@ -1086,6 +1225,7 @@ cumulative_factor = 1.0
 lo_factor = None
 hi_factor = None
 damping   = 1.0
+converged = False
 for iteration in range(1, MAX_ITERS + 1):
     _dlog(f"  ── iter {iteration} ──────────────────────────────")
     manifold = build_manifold(segs, TUBE_SIDES)
@@ -1135,6 +1275,7 @@ for iteration in range(1, MAX_ITERS + 1):
         if _ibar: _ibar.update(1)
         combined  = combined_iter
         final_vol = final_vol_iter
+        converged = True
         break
     # Correction steered on raw haptera volume (before boss/hole) since only tube radii are scaled.
     haptera_target = hull_vol_iter - _target_interstitial - (m_final.volume() - measured_vol)
@@ -1184,6 +1325,21 @@ for iteration in range(1, MAX_ITERS + 1):
         combined  = combined_iter
         final_vol = final_vol_iter
 if _ibar: _ibar.close()
+
+# ── persist multiplier for next run ──────────────────────────────────────────
+# Save the cumulative tube-radius multiplier (initial × per-iter corrections).
+# A re-run with the same config picks this up via USE_CACHED_FACTOR and skips
+# most of the iteration loop.  Logged so the value is also available to copy
+# into INITIAL_FACTOR by hand.
+_total_factor = _initial_factor * cumulative_factor
+_final_root_r = float(segs[0]['r']) if segs else 0.0
+_iv_frac      = (interstitial_iter / hull_vol_iter) if hull_vol_iter > 0 else 0.0
+print(f"  Cumulative radius multiplier: ×{_total_factor:.6f}  (initial ×{_initial_factor:.6f} × loop ×{cumulative_factor:.6f})")
+print(f"  Final root radius           : {_final_root_r:.6f}")
+if SAVE_CACHED_FACTOR:
+    _save_cached_factor(CACHE_FILE, _current_factor_config(), _total_factor,
+                        _final_root_r, _iv_frac, error, converged)
+    print(f"  Saved multiplier + config to {CACHE_FILE}")
 
 
 # Capture pre-repair interstitial measurements so the aggressive pass below
