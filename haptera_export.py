@@ -51,7 +51,7 @@ HORIZ_N      = 2   # number of horizontal cylinders: 1 = single centered cylinde
 HORIZ_S      = 100  # center-to-center spacing in Y between the two cylinders (ignored when HORIZ_N = 1)
 HORIZ_H      = 30  # height above the haptera base for horizontal cylinder centers
 
-SIMPLIFY_TARGET = 1000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
+SIMPLIFY_TARGET = 2000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
 
 N_ROOTS        = 40
 SEG_LEN        = CONE_H / DEPTH  # scales with cone height so branches traverse the full cone at any depth
