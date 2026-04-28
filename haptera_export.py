@@ -26,7 +26,10 @@ INTERTWINED = False  # True = roots spiral down the cone on helical lanes (see i
 DEPTH  = 9 #Number of nodes
 K      = 2 #Number of branches per node
 
-TUBE_SIDES = 10
+TUBE_SIDES = 20  # cross-section facets per tube; bumped from 10 because at the converged
+                 # leaf radius (~0.7 mm) a 10-sided cross-section gives QEM decimation only
+                 # ~0.45 mm chords, shorter than the 14 mm tube length, so the decimator
+                 # crushes the cross-section first and breaks watertightness.
 
 # ── convergence ───────────────────────────────────────────────────────────────
 TOLERANCE = 0.001 #0.1%
@@ -51,7 +54,9 @@ HORIZ_N      = 2   # number of horizontal cylinders: 1 = single centered cylinde
 HORIZ_S      = 100  # center-to-center spacing in Y between the two cylinders (ignored when HORIZ_N = 1)
 HORIZ_H      = 30  # height above the haptera base for horizontal cylinder centers
 
-SIMPLIFY_TARGET = 2000000  # target face count after QEM decimation (e.g. 50000); 0 = disabled
+SIMPLIFY_TARGET = 0  # target face count after QEM decimation (e.g. 50000); 0 = disabled.
+                     # Disabled to verify the manifold3d boolean output exports as watertight
+                     # without QEM-induced thin-feature damage. Trade-off: ~400 MB STL.
 
 N_ROOTS        = 40
 SEG_LEN        = CONE_H / DEPTH  # scales with cone height so branches traverse the full cone at any depth
@@ -1114,29 +1119,45 @@ def _drop_open_bodies(mesh):
     return len(unique) - len(keep)
 
 def _make_watertight(mesh, aggressive=False):
-    """Minimal pass: trust manifold3d's topology and only fix orientation.
+    """Repair pass.  Light path (default) only fixes winding; aggressive path
+    additionally welds duplicate vertices, drops broken faces, and plugs the
+    boundary loops left behind by QEM decimation.
 
     manifold3d's boolean output is guaranteed watertight (every edge has
-    exactly two faces) and stays watertight through the trimesh round-trip
-    when `process=False, validate=False` is used.  Earlier versions of this
-    function ran an aggressive merge_vertices + fill_holes + delete-non-
-    manifold-faces pipeline that *introduced* boundary edges and non-
-    manifold edges by collapsing legitimately-distinct vertices to within
-    1e-5 mm tolerance.  Diagnostic logging confirmed the trimesh wrapping
-    arrives watertight at every iteration; the corruption was downstream.
+    exactly two faces) and stays watertight through the trimesh round-trip,
+    so the iteration loop calls this with ``aggressive=False`` and pays only
+    the orientation check.  Decimation (``simplify_quadric_decimation``)
+    collapses edges and routinely produces a few hundred boundary edges and
+    non-manifold edges; the final-export path uses ``aggressive=True`` to
+    seal the mesh before STL writing.
 
-    The remaining work after the booleans is purely orientation:
-    fix_winding flips any back-facing face groups, and the volume-sign
-    check inverts the whole shell when the outward normal came out
-    pointing in.  Both are no-ops on already-correct meshes.
-
-    `aggressive` is kept as a parameter for compatibility with existing
-    call sites but no longer triggers any extra work — the iteration-loop
-    and final-export paths converge on the same result."""
+    The aggressive path is intentionally NOT used pre-decimation: at the
+    boolean output's vertex density (sub-millimetre spacing) trimesh's
+    merge_vertices tolerance can collapse legitimately-distinct vertices and
+    *introduce* boundary edges.  Post-decimation the vertex spacing is much
+    larger, so welding is safe."""
     if len(mesh.faces) == 0:
         return mesh
-    if not mesh.is_winding_consistent:
-        trimesh.repair.fix_winding(mesh)
+    if aggressive:
+        mesh.merge_vertices(merge_norm=True, merge_tex=True)
+        mesh.update_faces(mesh.unique_faces())
+        mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.remove_unreferenced_vertices()
+        if not mesh.is_winding_consistent:
+            trimesh.repair.fix_winding(mesh)
+        if not mesh.is_watertight:
+            broken = trimesh.repair.broken_faces(mesh)
+            if len(broken) > 0:
+                mask = np.ones(len(mesh.faces), dtype=bool)
+                mask[broken] = False
+                mesh.update_faces(mask)
+                mesh.remove_unreferenced_vertices()
+        if not mesh.is_watertight:
+            trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_normals(mesh)
+    else:
+        if not mesh.is_winding_consistent:
+            trimesh.repair.fix_winding(mesh)
     if mesh.is_watertight and mesh.volume < 0:
         mesh.invert()
     return mesh
