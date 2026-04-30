@@ -24,6 +24,8 @@ DEBUG       = False  # True = print per-function timing diagnostics
 INTERTWINED = False  # True = roots spiral down the cone on helical lanes (see intertwining parameters below)
 
 DEPTH  = 9 #Number of nodes
+ENDPOINTS_TO_FLOOR = True  # extend each leaf-branch tip vertically down to z=0 so
+                           # every endpoint touches the print bed (no overhangs).
 K      = 2 #Number of branches per node
 
 TUBE_SIDES = 20  # cross-section facets per tube; bumped from 10 because at the converged
@@ -53,6 +55,16 @@ HORIZ_HOLE_R = 7   # inner bore radius of horizontal bossed cylinders; set to 0 
 HORIZ_N      = 2   # number of horizontal cylinders: 1 = single centered cylinder, 2 = two at ±HORIZ_S/2
 HORIZ_S      = 100  # center-to-center spacing in Y between the two cylinders (ignored when HORIZ_N = 1)
 HORIZ_H      = 30  # height above the haptera base for horizontal cylinder centers
+HORIZ_RADIUS_FRAC = 0.9  # cylinder endpoints sit at this fraction of the cone radius
+                         # (taken at z = HORIZ_H), keeping the tubes inside the cone so
+                         # they do not protrude past the surface and need print supports.
+HORIZ_LEN    = 2.0 * np.sqrt(max(
+    0.0,
+    (HORIZ_RADIUS_FRAC * CONE_R * (1.0 - HORIZ_H / CONE_H)) ** 2 - (HORIZ_S / 2.0) ** 2,
+))  # derived length along X. With CONE_R=130, CONE_H=130, HORIZ_H=30, HORIZ_S=100,
+    # HORIZ_RADIUS_FRAC=0.9 → endpoints land at radial 90 mm (90% of the 100 mm cone
+    # radius at z=30), giving x = ±√(90² − 50²) ≈ ±74.833 mm and a total length of
+    # ≈149.666 mm. The cone wall at this height/y is at x≈±86.6 mm (≈12 mm clearance).
 
 SIMPLIFY_TARGET = 0  # target face count after QEM decimation (e.g. 50000); 0 = disabled.
                      # Disabled to verify the manifold3d boolean output exports as watertight
@@ -649,6 +661,35 @@ def build_manifold(segs, sides):
 
     return _run_manifold_union(meshes, _dlog)
 
+def _add_floor_supports(segs):
+    """Append vertical struts from each leaf-branch tip down to z=0 so every
+    haptera endpoint sits on the print bed.  A "leaf" is any segment endpoint
+    that is not the start of another segment.  Struts inherit the radius of
+    their leaf segment and stay vertical so they themselves never overhang."""
+    if not segs:
+        return segs
+    starts = {(round(float(s['start'][0]), 4),
+               round(float(s['start'][1]), 4),
+               round(float(s['start'][2]), 4)) for s in segs}
+    struts = []
+    for s in segs:
+        end = s['end']
+        key = (round(float(end[0]), 4),
+               round(float(end[1]), 4),
+               round(float(end[2]), 4))
+        if key in starts:
+            continue              # branch continues from this point — not a leaf
+        if end[2] <= 1e-3:
+            continue              # already on (or below) the floor
+        struts.append({
+            'start': np.array([float(end[0]), float(end[1]), float(end[2])]),
+            'end':   np.array([float(end[0]), float(end[1]), 0.0]),
+            'r':     s['r'],
+            'level': s.get('level', 0),
+        })
+    segs.extend(struts)
+    return segs
+
 # ── segment builder ───────────────────────────────────────────────────────────
 def build_segments(depth, k):
     """Generate the full skeleton of haptera segments for the given branching depth
@@ -687,6 +728,8 @@ def build_segments(depth, k):
     ref = cv if cv > 0 else nv
     if ref > 0:
         scale_radii(segs, np.sqrt(BASE_VOLUME / ref))
+    if ENDPOINTS_TO_FLOOR:
+        _add_floor_supports(segs)
     return segs
 
 # ── radius-multiplier cache ───────────────────────────────────────────────────
@@ -719,6 +762,9 @@ def _current_factor_config():
         'HORIZ_N': HORIZ_N,
         'HORIZ_S': HORIZ_S,
         'HORIZ_H': HORIZ_H,
+        'HORIZ_LEN': HORIZ_LEN,
+        'HORIZ_RADIUS_FRAC': HORIZ_RADIUS_FRAC,
+        'ENDPOINTS_TO_FLOOR': ENDPOINTS_TO_FLOOR,
     }
 
 def _parse_cache_value(s):
@@ -1119,45 +1165,29 @@ def _drop_open_bodies(mesh):
     return len(unique) - len(keep)
 
 def _make_watertight(mesh, aggressive=False):
-    """Repair pass.  Light path (default) only fixes winding; aggressive path
-    additionally welds duplicate vertices, drops broken faces, and plugs the
-    boundary loops left behind by QEM decimation.
+    """Minimal pass: trust manifold3d's topology and only fix orientation.
 
     manifold3d's boolean output is guaranteed watertight (every edge has
-    exactly two faces) and stays watertight through the trimesh round-trip,
-    so the iteration loop calls this with ``aggressive=False`` and pays only
-    the orientation check.  Decimation (``simplify_quadric_decimation``)
-    collapses edges and routinely produces a few hundred boundary edges and
-    non-manifold edges; the final-export path uses ``aggressive=True`` to
-    seal the mesh before STL writing.
+    exactly two faces) and stays watertight through the trimesh round-trip
+    when `process=False, validate=False` is used.  Earlier versions of this
+    function ran an aggressive merge_vertices + fill_holes + delete-non-
+    manifold-faces pipeline that *introduced* boundary edges and non-
+    manifold edges by collapsing legitimately-distinct vertices to within
+    1e-5 mm tolerance.  Diagnostic logging confirmed the trimesh wrapping
+    arrives watertight at every iteration; the corruption was downstream.
 
-    The aggressive path is intentionally NOT used pre-decimation: at the
-    boolean output's vertex density (sub-millimetre spacing) trimesh's
-    merge_vertices tolerance can collapse legitimately-distinct vertices and
-    *introduce* boundary edges.  Post-decimation the vertex spacing is much
-    larger, so welding is safe."""
+    The remaining work after the booleans is purely orientation:
+    fix_winding flips any back-facing face groups, and the volume-sign
+    check inverts the whole shell when the outward normal came out
+    pointing in.  Both are no-ops on already-correct meshes.
+
+    `aggressive` is kept as a parameter for compatibility with existing
+    call sites but no longer triggers any extra work — the iteration-loop
+    and final-export paths converge on the same result."""
     if len(mesh.faces) == 0:
         return mesh
-    if aggressive:
-        mesh.merge_vertices(merge_norm=True, merge_tex=True)
-        mesh.update_faces(mesh.unique_faces())
-        mesh.update_faces(mesh.nondegenerate_faces())
-        mesh.remove_unreferenced_vertices()
-        if not mesh.is_winding_consistent:
-            trimesh.repair.fix_winding(mesh)
-        if not mesh.is_watertight:
-            broken = trimesh.repair.broken_faces(mesh)
-            if len(broken) > 0:
-                mask = np.ones(len(mesh.faces), dtype=bool)
-                mask[broken] = False
-                mesh.update_faces(mask)
-                mesh.remove_unreferenced_vertices()
-        if not mesh.is_watertight:
-            trimesh.repair.fill_holes(mesh)
-        trimesh.repair.fix_normals(mesh)
-    else:
-        if not mesh.is_winding_consistent:
-            trimesh.repair.fix_winding(mesh)
+    if not mesh.is_winding_consistent:
+        trimesh.repair.fix_winding(mesh)
     if mesh.is_watertight and mesh.volume < 0:
         mesh.invert()
     return mesh
@@ -1198,7 +1228,7 @@ if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
             # Euler angles in degrees applied in the model's z-y'-x" order;
             # a 90° pitch (Y rotation) maps the Z-cylinder onto the +X axis.
             _boss_mfd = _Manifold.cylinder(
-                height=2.2 * CONE_R,
+                height=HORIZ_LEN,
                 radius_low=HORIZ_BOSS_R,
                 circular_segments=64,
                 center=True,
@@ -1206,10 +1236,10 @@ if HORIZ_BOSS_R > 0 or HORIZ_HOLE_R > 0:
             _boss_mfd_clipped = _boss_mfd ^ _cone_clip_manifold
             _horiz_boss_manifolds.append(_boss_mfd_clipped)
         if HORIZ_HOLE_R > 0:
-            # Bore is intentionally oversized (not clipped to the cone) so it punches
-            # cleanly through the boss without coplanar end-cap artefacts at the cone wall.
+            # Bore is slightly longer than the boss so it punches cleanly through both
+            # end caps without coplanar end-cap artefacts.
             _inner_mfd = _Manifold.cylinder(
-                height=2.2 * CONE_R,
+                height=HORIZ_LEN + 2.0,
                 radius_low=HORIZ_HOLE_R,
                 circular_segments=64,
                 center=True,
